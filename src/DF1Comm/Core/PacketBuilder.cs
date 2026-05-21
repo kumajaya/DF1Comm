@@ -1,0 +1,227 @@
+namespace DF1Comm.Core;
+
+/// <summary>
+/// Factory for building DF1 application-layer PDUs (Protocol Data Units).
+/// All methods allocate byte arrays with +1 extra byte (compatible with original VB code).
+/// Does not perform DLE stuffing or checksum calculation.
+/// Reference: Allen Bradley Publication 1770-6.5.16
+/// </summary>
+public static class PacketBuilder
+{
+    /// <summary>
+    /// Builds a generic command packet (CMD, STS, TNS, FNC, data).
+    /// Buffer allocation = (headerLen + dataLen) + 1 extra byte (compatible with original).
+    /// </summary>
+    public static byte[] BuildCommandWithData(int command, int func, byte[] data, ushort tns,
+                                                int myNode, int targetNode, bool useDf1Protocol)
+    {
+        int dataLen = data.Length;
+        int headerLen = useDf1Protocol ? 6 : 10;
+        int totalLen = headerLen + dataLen;
+        byte[] pkt = new byte[totalLen + 1]; // +1 as in original
+        int pos = 0;
+
+        if (useDf1Protocol)
+        {
+            // DF1: DST, SRC, CMD, STS, TNS_LOW, TNS_HIGH, FNC, data...
+            pkt[pos++] = (byte)targetNode;
+            pkt[pos++] = (byte)myNode;
+            pkt[pos++] = (byte)command;
+            pkt[pos++] = 0x00; // STS
+            pkt[pos++] = (byte)(tns & 0xFF);
+            pkt[pos++] = (byte)((tns >> 8) & 0xFF);
+            pkt[pos++] = (byte)func;
+        }
+        else
+        {
+            // DH485 format
+            pkt[pos++] = (byte)(targetNode + 0x80);
+            pkt[pos++] = 0x88;
+            pkt[pos++] = (byte)(myNode + 0x80);
+            pkt[pos++] = 0x01;
+            pkt[pos++] = 0x01;
+            pkt[pos++] = (byte)(dataLen + 5);
+            pkt[pos++] = (byte)command;
+            pkt[pos++] = 0x00; // STS
+            pkt[pos++] = (byte)(tns & 0xFF);
+            pkt[pos++] = (byte)((tns >> 8) & 0xFF);
+            pkt[pos++] = (byte)func;
+        }
+
+        if (dataLen > 0)
+            Array.Copy(data, 0, pkt, pos, dataLen);
+
+        return pkt;
+    }
+
+    /// <summary>
+    /// Builds a Protected Write packet (CMD=0x0F) with the specified function.
+    /// </summary>
+    public static byte[] BuildProtectedWrite(int func, byte[] data, ushort tns,
+                                                int myNode, int targetNode, bool useDf1Protocol)
+    {
+        return BuildCommandWithData(0x0F, func, data, tns, myNode, targetNode, useDf1Protocol);
+    }
+
+    /// <summary>
+    /// Builds the body for a read command (0xA1 / 0xA2).
+    /// Buffer allocation = (dataSize) + 1 extra byte (compatible with original).
+    /// </summary>
+    public static byte[] BuildReadRequestBody(DataAddress addr, int numberOfBytesToRead, out int function)
+    {
+        function = (addr.SubElement == 0) ? 0xA1 : 0xA2;
+        int dataSize = (addr.SubElement == 0) ? 3 : 4;
+        if (addr.Element >= 255) dataSize += 2;
+        if (addr.SubElement >= 255) dataSize += 2;
+
+        byte[] body = new byte[dataSize + 1]; // +1 as in original
+        int idx = 0;
+
+        body[idx++] = (byte)numberOfBytesToRead;
+        body[idx++] = (byte)addr.FileNumber;
+        body[idx++] = (byte)addr.FileType;
+
+        // Element
+        if (addr.Element < 255)
+            body[idx++] = (byte)addr.Element;
+        else
+        {
+            body[idx++] = 255;
+            body[idx++] = (byte)(addr.Element & 0xFF);
+            body[idx++] = (byte)((addr.Element >> 8) & 0xFF);
+        }
+
+        // Sub-element (only if function == 0xA2)
+        if (function == 0xA2)
+        {
+            if (addr.SubElement < 255)
+                body[idx++] = (byte)addr.SubElement;
+            else
+            {
+                body[idx++] = 255;
+                body[idx++] = (byte)(addr.SubElement & 0xFF);
+                body[idx++] = (byte)((addr.SubElement >> 8) & 0xFF);
+            }
+        }
+
+        return body;
+    }
+
+    /// <summary>
+    /// Builds the body for a write command (0xAA word write / 0xAB bit write).
+    /// Buffer allocation = (dataSize) + 1 extra byte (compatible with original).
+    /// </summary>
+    public static byte[] BuildWriteRequestBody(DataAddress addr, byte[] dataToWrite,
+                                                int writeOffset, int bytesToWrite, out int function)
+    {
+        // Bit write (0xAB)
+        if (addr.BitNumber >= 0 && addr.BitNumber < 16)
+        {
+            function = 0xAB;
+            byte[] body = new byte[8 + 1]; // original: 8 bytes + 1 extra
+            int idx = 0;
+            body[idx++] = (byte)bytesToWrite;
+            body[idx++] = (byte)addr.FileNumber;
+            body[idx++] = (byte)addr.FileType;
+
+            // Element
+            if (addr.Element < 255)
+                body[idx++] = (byte)addr.Element;
+            else
+            {
+                body[idx++] = 255;
+                body[idx++] = (byte)(addr.Element & 0xFF);
+                body[idx++] = (byte)((addr.Element >> 8) & 0xFF);
+            }
+
+            // Sub-element
+            if (addr.SubElement < 255)
+                body[idx++] = (byte)addr.SubElement;
+            else
+            {
+                body[idx++] = 255;
+                body[idx++] = (byte)(addr.SubElement & 0xFF);
+                body[idx++] = (byte)((addr.SubElement >> 8) & 0xFF);
+            }
+
+            int bitMask = 1 << addr.BitNumber;
+            body[idx++] = (byte)(bitMask & 0xFF);
+            body[idx++] = (byte)((bitMask >> 8) & 0xFF);
+
+            // Value
+            if (writeOffset < dataToWrite.Length && dataToWrite[writeOffset] != 0)
+            {
+                body[idx++] = (byte)(bitMask & 0xFF);
+                body[idx++] = (byte)((bitMask >> 8) & 0xFF);
+            }
+            else
+            {
+                body[idx++] = 0;
+                body[idx++] = 0;
+            }
+            return body;
+        }
+        else
+        {
+            // Word write (0xAA)
+            function = 0xAA;
+            // Calculate base size: 5 (size,file,type,element,subelement) + bytesToWrite
+            int dataSize = 5 + bytesToWrite;
+            if (addr.Element >= 255) dataSize += 2;
+            if (addr.SubElement >= 255) dataSize += 2;
+
+            byte[] body = new byte[dataSize + 1]; // +1 extra
+            int idx = 0;
+
+            body[idx++] = (byte)bytesToWrite;
+            body[idx++] = (byte)addr.FileNumber;
+            body[idx++] = (byte)addr.FileType;
+
+            // Element
+            if (addr.Element < 255)
+                body[idx++] = (byte)addr.Element;
+            else
+            {
+                body[idx++] = 255;
+                body[idx++] = (byte)(addr.Element & 0xFF);
+                body[idx++] = (byte)((addr.Element >> 8) & 0xFF);
+            }
+
+            // Sub-element
+            if (addr.SubElement < 255)
+                body[idx++] = (byte)addr.SubElement;
+            else
+            {
+                body[idx++] = 255;
+                body[idx++] = (byte)(addr.SubElement & 0xFF);
+                body[idx++] = (byte)((addr.SubElement >> 8) & 0xFF);
+            }
+
+            // Data
+            int copyLen = Math.Min(bytesToWrite, dataToWrite.Length - writeOffset);
+            Array.Copy(dataToWrite, writeOffset, body, idx, copyLen);
+            return body;
+        }
+    }
+
+    /// <summary>
+    /// Builds a complete read packet for DF1.
+    /// </summary>
+    public static byte[] BuildReadPacket(DataAddress addr, int numberOfBytesToRead, ushort tns,
+                                            int myNode, int targetNode)
+    {
+        byte[] body = BuildReadRequestBody(addr, numberOfBytesToRead, out int func);
+        return BuildCommandWithData(0x0F, func, body, tns, myNode, targetNode, true);
+    }
+
+    /// <summary>
+    /// Builds a complete write packet for DF1.
+    /// </summary>
+    public static byte[] BuildWritePacket(DataAddress addr, byte[] dataToWrite,
+                                            int writeOffset, int bytesToWrite, ushort tns,
+                                            int myNode, int targetNode)
+    {
+        byte[] body = BuildWriteRequestBody(addr, dataToWrite, writeOffset, bytesToWrite, out int func);
+        return BuildCommandWithData(0x0F, func, body, tns, myNode, targetNode, true);
+    }
+}

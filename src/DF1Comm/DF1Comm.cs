@@ -1,0 +1,1037 @@
+// **********************************************************************************************
+// * DF1 Application Layer (DF1Comm) – fully compatible with original VB code.
+// * Uses DataLink for data link layer (framing, ACK/NAK, checksum)
+// * Uses PacketBuilder for packet assembly
+// * All behaviors (polling, SleepDelay, TNS, DH485) are identical to the original.
+// *
+// * Original VB: Archie Jacobs, Manufacturing Automation LLC
+// * C# Port: modularized, behavior‑preserving, zero‑behavioral‑gap
+// *
+// * Reference: Allen Bradley Publication 1770-6.5.16
+// *
+// * Distributed under the GNU General Public License (www.gnu.org)
+// **********************************************************************************************
+
+using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.Text;
+using DF1Comm.Core;
+
+namespace DF1Comm
+{
+    public class DF1Comm : IDisposable
+    {
+        // ─── Fields (exactly as original) ────────────────────────────────────────
+        private readonly Random rnd = new Random();
+        private ushort TNS;
+        private int ProcessorType;
+        private int SleepDelay;          // backoff delay, managed by DataLink but also used locally
+
+        private readonly int[] Responded = new int[256]; // 0=false, 1=true
+        // ConcurrentDictionary used instead of Collection<byte>[] to allow thread-safe
+        // atomic reference assignment between the receive thread pool callback and the
+        // calling thread reading packet data after WaitForResponse.
+        private readonly ConcurrentDictionary<int, byte[]> DataPackets = new();
+
+        // DH485 specific
+        private readonly Collection<byte> QueuedCommand = new Collection<byte>();
+        private bool CommandInQueue;
+        private bool PacketOpened;
+
+        // Flag to suppress DataReceived events during bulk transfers (upload/download/autodetect)
+        private bool DisableEvent;
+
+        // Data link layer reference
+        private readonly DataLink dataLink;
+
+        // Properties (exactly as original)
+        public int MyNode { get; set; }
+        public int TargetNode { get; set; }
+
+        private int m_BaudRate = 19200;
+        public int BaudRate
+        {
+            get => m_BaudRate;
+            set { if (value != m_BaudRate) CloseComms(); m_BaudRate = value; }
+        }
+
+        private string m_ComPort = "COM1";
+        public string ComPort
+        {
+            get => m_ComPort;
+            set { if (value != m_ComPort) CloseComms(); m_ComPort = value; }
+        }
+
+        private System.IO.Ports.Parity m_Parity = System.IO.Ports.Parity.None;
+        public System.IO.Ports.Parity Parity
+        {
+            get => m_Parity;
+            set { if (value != m_Parity) CloseComms(); m_Parity = value; }
+        }
+
+        public string Protocol { get; set; } = "DF1";
+        private CheckSumOptions m_CheckSum = CheckSumOptions.Crc;
+        public CheckSumOptions CheckSum
+        {
+            get => m_CheckSum;
+            set { m_CheckSum = value; dataLink.ChecksumType = value; }
+        }
+        public bool AsyncMode { get; set; }
+
+        // ─── Events ──────────────────────────────────────────────────────────────
+        public event EventHandler? DataReceived;
+        public event EventHandler? UnsolictedMessageRcvd;
+        public event EventHandler? AutoDetectTry;
+        public event EventHandler? DownloadProgress;
+        public event EventHandler? UploadProgress;
+
+        // ─── Constructor ─────────────────────────────────────────────────────────
+        public DF1Comm(string? portName = null, int baud = 19200,
+                       System.IO.Ports.Parity parity = System.IO.Ports.Parity.None)
+        {
+            TNS = (ushort)((rnd.Next() & 0x7F) + 1);
+            if (!string.IsNullOrEmpty(portName))
+            {
+                m_ComPort = portName;
+                m_BaudRate = baud;
+                m_Parity = parity;
+            }
+            var port = new SerialPortWrapper(m_ComPort, m_BaudRate, m_Parity);
+            dataLink = new DataLink(port);
+            dataLink.ChecksumType = CheckSum;
+            dataLink.PacketReceived += DataLink_PacketReceived;
+            dataLink.EnqReceived += DataLink_EnqReceived;
+            // Keep SleepDelay in sync with DataLink
+            SleepDelay = dataLink.SleepDelay;
+        }
+
+        // =========================================================================
+        // PUBLIC METHODS (identical to original, but using DataLink and PacketBuilder)
+        // =========================================================================
+
+        public void SetRunMode()
+        {
+            byte[] data = new byte[1];
+            int func;
+            if (GetProcessorType() == 0x58) { data[0] = 2; func = 0x3A; }
+            else { data[0] = 6; func = 0x80; }
+            int reply = PrefixAndSend(0xF, func, data, true, out _);
+            if (reply != 0)
+                throw new DF1Exception("Failed to change to Run mode, Check PLC Key switch - " + MessageDecoder.DecodeMessage(reply));
+        }
+
+        public int GetRunMode()
+        {
+            int result = PrefixAndSend(0x06, 0x01, new byte[0], true, out int rTNS);
+            if (result == 0 && DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 6)
+                return pkt[6];
+            return -1;
+        }
+
+        public void SetProgramMode()
+        {
+            byte[] data = new byte[1];
+            int func;
+            if (GetProcessorType() == 0x58) { data[0] = 0; func = 0x3A; }
+            else { data[0] = 1; func = 0x80; }
+            int reply = PrefixAndSend(0xF, func, data, true, out _);
+            if (reply != 0)
+                throw new DF1Exception("Failed to change to Program mode, Check PLC Key switch - " + MessageDecoder.DecodeMessage(reply));
+        }
+
+        public int GetProcessorType()
+        {
+            byte[] data = Array.Empty<byte>();
+            if (PrefixAndSend(6, 3, data, true, out int rTNS) == 0)
+            {
+                if (DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 9)
+                    ProcessorType = pkt[9];
+                else
+                    throw new DF1Exception("GetProcessorType: response packet too short");
+            }
+            return ProcessorType;
+        }
+
+        // ─── Read ─────────────────────────────────────────────────────────────────
+        public string[] ReadAny(string startAddress, int numberOfElements)
+        {
+            // Exactly same as original, calls ReadRawData and AddressParser
+            DataAddress p = AddressParser.Parse(startAddress);
+            if (p.FileType == 0) throw new DF1Exception("Invalid Address");
+
+            short arrayElements = (short)(numberOfElements - 1);
+            if (arrayElements < 0) arrayElements = 0;
+            if (p.BitNumber < 16) arrayElements = (short)Math.Floor(numberOfElements / 16.0);
+
+            int numberOfBytes;
+            switch (p.FileType)
+            {
+                case 0x8D: numberOfBytes = (arrayElements + 1) * 84; break;
+                case 0x8A: numberOfBytes = (arrayElements + 1) * 4; break;
+                case 0x91: numberOfBytes = (arrayElements + 1) * 4; break;
+                case 0x92: numberOfBytes = (arrayElements + 1) * 50; break;
+                case 0x86:
+                case 0x87: numberOfBytes = (arrayElements + 1) * 2; break;
+                default: numberOfBytes = (arrayElements + 1) * 2; break;
+            }
+
+            if (p.SubElement > 0 && (p.FileType == 0x86 || p.FileType == 0x87))
+                numberOfBytes = (numberOfBytes * 3) - 4;
+
+            int reply = 0;
+            byte[] returnedData = new byte[numberOfBytes + 1];
+            int returnedDataIndex = 0, retries = 0;
+
+            while (reply == 0 && returnedDataIndex < numberOfBytes)
+            {
+                byte[] chunk = ReadRawData(p, numberOfBytes, out reply);
+                if (reply == 0) { chunk.CopyTo(returnedData, returnedDataIndex); returnedDataIndex += numberOfBytes; }
+                else if (retries < 2) { retries++; reply = 0; }
+                else throw new DF1Exception(MessageDecoder.DecodeMessage(reply));
+            }
+
+            string[] result = new string[arrayElements + 1];
+            switch (p.FileType)
+            {
+                case 0x8A:
+                    for (int i = 0; i <= arrayElements; i++)
+                        result[i] = BitConverter.ToSingle(returnedData, i * 4).ToString();
+                    break;
+                case 0x8D:
+                    for (int i = 0; i <= arrayElements; i++)
+                    {
+                        int strLen = BitConverter.ToInt16(returnedData, i * 84);
+                        if (strLen > 82) strLen = 82;
+                        var sb = new StringBuilder();
+                        int j = 2;
+                        while (j < strLen + 2 && (i * 84) + j + 1 < returnedData.Length &&
+                               returnedData[(i * 84) + j + 1] > 0)
+                        {
+                            sb.Append(Encoding.ASCII.GetString(new byte[] { returnedData[(i * 84) + j + 1] }));
+                            if (j < strLen + 1 && returnedData[(i * 84) + j] > 0)
+                                sb.Append(Encoding.ASCII.GetString(new byte[] { returnedData[(i * 84) + j] }));
+                            j += 2;
+                        }
+                        result[i] = sb.ToString();
+                    }
+                    break;
+                case 0x86:
+                case 0x87:
+                    for (int i = 0; i <= arrayElements; i++)
+                    {
+                        int j = p.SubElement > 0 ? i * 6 : i * 2;
+                        result[i] = BitConverter.ToInt16(returnedData, j).ToString();
+                    }
+                    break;
+                case 0x91:
+                    for (int i = 0; i <= arrayElements; i++)
+                        result[i] = BitConverter.ToInt32(returnedData, i * 4).ToString();
+                    break;
+                case 0x92:
+                    for (int i = 0; i <= arrayElements; i++)
+                        result[i] = BitConverter.ToString(returnedData, i * 50, 50);
+                    break;
+                default:
+                    for (int i = 0; i <= arrayElements; i++)
+                        result[i] = BitConverter.ToInt16(returnedData, i * 2).ToString();
+                    break;
+            }
+
+            if (p.BitNumber >= 0 && p.BitNumber < 16)
+            {
+                string[] bitResult = new string[numberOfElements];
+                int bitPos = p.BitNumber, wordPos = 0;
+                for (int i = 0; i < numberOfElements; i++)
+                {
+                    bitResult[i] = ((Convert.ToInt32(result[wordPos]) & (int)Math.Pow(2, bitPos)) != 0).ToString();
+                    if (++bitPos > 15) { bitPos = 0; wordPos++; }
+                }
+                return bitResult;
+            }
+
+            return result;
+        }
+
+        public string ReadAny(string startAddress) => ReadAny(startAddress, 1)[0];
+        public int[] ReadInt(string startAddress, int numberOfElements)
+        {
+            string[] result = ReadAny(startAddress, numberOfElements);
+            int[] ints = new int[result.Length];
+            for (int i = 0; i < result.Length; i++) ints[i] = Convert.ToInt32(result[i]);
+            return ints;
+        }
+
+        // ─── Write ────────────────────────────────────────────────────────────────
+        public string WriteData(string startAddress, int dataToWrite)
+            => WriteData(startAddress, 1, new int[] { dataToWrite }).ToString();
+
+        public int WriteData(string startAddress, int numberOfElements, int[] dataToWrite)
+        {
+            DataAddress p = AddressParser.Parse(startAddress);
+            byte[] converted = new byte[numberOfElements * p.BytesPerElements + 1];
+            if (p.FileType == 0x91)
+            {
+                for (int i = 0; i < numberOfElements; i++)
+                    BitConverter.GetBytes(dataToWrite[i]).CopyTo(converted, i * 4);
+            }
+            else
+            {
+                for (int i = 0; i < numberOfElements; i++)
+                {
+                    if (dataToWrite[i] > 32767 || dataToWrite[i] < -32768)
+                        throw new DF1Exception("Integer data out of range, must be between -32768 and 32767");
+                    converted[i * 2] = (byte)(dataToWrite[i] & 0xFF);
+                    converted[i * 2 + 1] = (byte)((dataToWrite[i] >> 8) & 0xFF);
+                }
+            }
+            return WriteRawData(p, numberOfElements * p.BytesPerElements, converted);
+        }
+
+        public int WriteData(string startAddress, float dataToWrite)
+            => WriteData(startAddress, 1, new float[] { dataToWrite });
+
+        public int WriteData(string startAddress, int numberOfElements, float[] dataToWrite)
+        {
+            DataAddress p = AddressParser.Parse(startAddress);
+            byte[] converted = new byte[numberOfElements * p.BytesPerElements + 1];
+            if (p.FileType == 0x8A)
+            {
+                for (int i = 0; i < numberOfElements; i++)
+                    BitConverter.GetBytes(dataToWrite[i]).CopyTo(converted, i * 4);
+            }
+            else if (p.FileType == 0x91)
+            {
+                for (int i = 0; i < numberOfElements; i++)
+                {
+                    if (dataToWrite[i] > 2147483647 || dataToWrite[i] < -2147483648)
+                        throw new DF1Exception("Integer data out of range, must be between -2147483648 and 2147483647");
+                    BitConverter.GetBytes((int)dataToWrite[i]).CopyTo(converted, i * 4);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < numberOfElements; i++)
+                {
+                    if (dataToWrite[i] > 32767 || dataToWrite[i] < -32768)
+                        throw new DF1Exception("Integer data out of range, must be between -32768 and 32767");
+                    converted[i * 2] = (byte)((int)dataToWrite[i] & 0xFF);
+                    converted[i * 2 + 1] = (byte)(((int)dataToWrite[i] >> 8) & 0xFF);
+                }
+            }
+            return WriteRawData(p, numberOfElements * p.BytesPerElements, converted);
+        }
+
+        public int WriteData(string startAddress, string dataToWrite)
+        {
+            if (string.IsNullOrEmpty(dataToWrite)) return 0; // changed: null check alone is not sufficient
+            DataAddress p = AddressParser.Parse(startAddress);
+
+            // Limit string length to 82 characters (max AB ST file)
+            if (dataToWrite.Length > 82) dataToWrite = dataToWrite.Substring(0, 82);
+
+            dataToWrite += "\0";
+            // Alocation: 2 byte header (length word) + string length (padded to even)
+            int byteCount = ((dataToWrite.Length + 1) / 2) * 2 + 2;
+            byte[] converted = new byte[byteCount];
+
+            converted[0] = (byte)(dataToWrite.Length - 1);
+            int i = 2;
+            while (i < dataToWrite.Length + 1) // < not <=, prevent overrun
+            {
+                if (i - 1 < dataToWrite.Length)
+                    converted[i] = Encoding.ASCII.GetBytes(dataToWrite.Substring(i - 1, 1))[0];
+                if (i - 2 < dataToWrite.Length)
+                    converted[i + 1] = Encoding.ASCII.GetBytes(dataToWrite.Substring(i - 2, 1))[0];
+                i += 2;
+            }
+            return WriteRawData(p, dataToWrite.Length + 1, converted);
+        }
+
+        // ─── Data Memory ─────────────────────────────────────────────────────────
+        public DataFileDetails[] GetDataMemory()
+        {
+            byte[] fzd = ReadFileDirectory();
+            int numberOfDataTables = fzd[52] + fzd[53] * 256;
+            var dataFiles = new Collection<DataFileDetails>();
+
+            int filePosition, bytesPerRow;
+            switch (ProcessorType)
+            {
+                case 0x25: case 0x58: filePosition = 93; bytesPerRow = 8; break;
+                case 0x88: case 0x89: case 0x8C: case 0x9C: filePosition = 103; bytesPerRow = 10; break;
+                default: filePosition = 79; bytesPerRow = 10; break;
+            }
+
+            int i = 0, k = 0;
+            while (k < numberOfDataTables && filePosition + 2 < fzd.Length)
+            {
+                int bpe = FileTypeToBytesPerElement(fzd[filePosition], out string ftStr);
+                var df = new DataFileDetails
+                {
+                    FileType = ftStr,
+                    NumberOfElements = (fzd[filePosition + 1] + fzd[filePosition + 2] * 256) / bpe,
+                    FileNumber = i
+                };
+                if (fzd[filePosition] > 0x81 && fzd[filePosition] < 0x9F) { dataFiles.Add(df); k++; }
+                if (k > 0) i++;
+                filePosition += bytesPerRow;
+            }
+
+            var result = new DataFileDetails[dataFiles.Count];
+            dataFiles.CopyTo(result, 0);
+            return result;
+        }
+
+        public DataFileDetails[] GetML1500DataMemory()
+        {
+            var pAddr = new DataAddress { FileNumber = 0, FileType = 2, Element = 0x2F };
+            byte[] data = ReadRawData(pAddr, 2, out int reply);
+            if (reply != 0) throw new DF1Exception(MessageDecoder.DecodeMessage(reply) + " - Failed to get data table list");
+
+            int fzSize = data[0] + data[1] * 256;
+            pAddr.Element = 0; pAddr.SubElement = 0;
+            byte[] fzd = ReadRawData(pAddr, fzSize, out reply);
+            if (reply != 0) throw new DF1Exception(MessageDecoder.DecodeMessage(reply) + " - Failed to get data table list");
+
+            var list = new List<DataFileDetails>();
+            int filePosition = 143, idx = 0;
+            while (filePosition + 2 < fzd.Length)
+            {
+                int bpe = FileTypeToBytesPerElement(fzd[filePosition], out string ftStr);
+                var df = new DataFileDetails
+                {
+                    FileType = ftStr,
+                    NumberOfElements = (fzd[filePosition + 1] + fzd[filePosition + 2] * 256) / bpe,
+                    FileNumber = idx
+                };
+                if (fzd[filePosition] > 0x81 && fzd[filePosition] < 0x95) { list.Add(df); idx++; }
+                filePosition += 10;
+            }
+            return list.ToArray();
+        }
+
+        // ─── IO Config ────────────────────────────────────────────────────────────
+        public int GetSlotCount()
+        {
+            byte[] data = { 4, 0, 0x60, 0, 0 };
+            int reply = PrefixAndSend(0xF, 0xA2, data, true, out int rTNS);
+            if (reply == 0 && DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 6)
+                return pkt[6] > 0 ? pkt[6] - 1 : 0;
+            throw new DF1Exception("Failed to get Slot Count - " + MessageDecoder.DecodeMessage(reply));
+        }
+
+        public IOConfig[] GetIOConfig()
+        {
+            int pt = GetProcessorType();
+            return (pt == 0x89 || pt == 0x8C) ? GetML1500IOConfig() : GetSLCIOConfig();
+        }
+
+        public IOConfig[] GetSLCIOConfig()
+        {
+            int slots = GetSlotCount();
+            if (slots <= 0) throw new DF1Exception("Failed to get Slot Count");
+            byte[] data = { (byte)(4 + (slots + 1) * 6 + 2), 0, 0x60, 0, 0 };
+            int reply = PrefixAndSend(0xF, 0xA2, data, true, out int rTNS);
+            if (reply != 0) throw new DF1Exception("Failed to get IO Config - " + MessageDecoder.DecodeMessage(reply));
+
+            var result = new IOConfig[slots + 1];
+            if (!DataPackets.TryGetValue(rTNS, out byte[]? pkt))
+                throw new DF1Exception("No IO Config data returned from PLC.");
+            for (int i = 0; i <= slots; i++)
+            {
+                if (i * 6 + 15 >= pkt.Length)
+                    throw new DF1Exception($"IO Config packet too short for slot {i}.");
+                result[i].InputBytes  = pkt[i * 6 + 10];
+                result[i].OutputBytes = pkt[i * 6 + 12];
+                result[i].CardCode    = BitConverter.ToInt16(new byte[] { pkt[i * 6 + 14], pkt[i * 6 + 15] }, 0);
+            }
+            return result;
+        }
+
+        public IOConfig[] GetML1500IOConfig()
+        {
+            byte[] data = { 4, 0, 0x62, 0, 0 };
+            int reply = PrefixAndSend(0xF, 0xA2, data, true, out int rTNS);
+            if (reply != 0) throw new DF1Exception("Failed to get IO Config for ML1500 - " + MessageDecoder.DecodeMessage(reply));
+
+            if (!DataPackets.TryGetValue(rTNS, out byte[]? pkt0) || pkt0.Length <= 6)
+                throw new DF1Exception("Failed to get IO Config for ML1500 - response too short");
+            int fzSize = pkt0[6] * 2;
+            byte[] fzd = new byte[fzSize + 1];
+            int filePosition = 0, subElement = 0;
+            data[0] = (byte)(fzSize > 0x50 ? 0x50 : fzSize);
+
+            while (filePosition < fzSize && reply == 0)
+            {
+                reply = PrefixAndSend(0xF, 0xA2, data, true, out rTNS);
+                if (DataPackets.TryGetValue(rTNS, out byte[]? chunk))
+                {
+                    int i = 0;
+                    while (i < data[0] && filePosition < fzSize) fzd[filePosition++] = chunk[i++ + 6];
+                }
+
+                subElement += data[0] / 2;
+                if (subElement < 255) { data[3] = (byte)subElement; }
+                else
+                {
+                    if (data.Length < 6) Array.Resize(ref data, 6);
+                    data[5] = (byte)(subElement / 256);
+                    data[4] = (byte)(subElement - data[5] * 256);
+                    data[3] = 255;
+                }
+                data[0] = (byte)(fzSize - filePosition < 80 ? fzSize - filePosition : 80);
+            }
+
+            int slotCount = fzd[2] - 2; if (slotCount < 0) slotCount = 0;
+            var result = new IOConfig[slotCount + 1];
+            int idx = 32 + slotCount * 4;
+            for (int s = 1; s <= slotCount; s++)
+            {
+                if (idx + 19 >= fzd.Length)
+                    throw new DF1Exception($"ML1500 IO Config data too short for slot {s}.");
+                result[s].InputBytes = fzd[idx + 2] * 2;
+                result[s].OutputBytes = fzd[idx + 8] * 2;
+                result[s].CardCode = BitConverter.ToInt16(new byte[] { fzd[idx + 18], fzd[idx + 19] }, 0);
+                idx += 26;
+            }
+
+            data = new byte[] { 8, 0, 0x60, 0, 0 };
+            reply = PrefixAndSend(0xF, 0xA2, data, true, out rTNS);
+            if (reply == 0 && DataPackets.TryGetValue(rTNS, out byte[]? basePkt) && basePkt.Length > 12)
+            {
+                result[0].InputBytes  = basePkt[10];
+                result[0].OutputBytes = basePkt[12];
+            }
+            else throw new DF1Exception("Failed to get Base IO Config for ML1500 - " + MessageDecoder.DecodeMessage(reply));
+
+            return result;
+        }
+
+        // ─── Upload / Download ────────────────────────────────────────────────────
+        public Collection<PLCFileDetails> UploadProgramData()
+        {
+            // Suppress DataReceived events during upload to avoid flooding
+            DisableEvent = true;
+            try
+            {
+                byte[] fzd = ReadFileDirectory();
+                var programFiles = new Collection<PLCFileDetails>();
+                programFiles.Add(new PLCFileDetails { FileNumber = 0, Data = fzd, FileType = 0, NumberOfBytes = fzd.Length });
+                UploadProgress?.Invoke(this, EventArgs.Empty);
+
+                int numberOfProgramFiles = fzd[46] + fzd[47] * 256;
+                int filePosition = ProcessorType == 0x25 || ProcessorType == 0x58 ? 93
+                                 : ProcessorType == 0x88 || ProcessorType == 0x89 || ProcessorType == 0x8C || ProcessorType == 0x9C ? 103
+                                 : 79;
+
+                int dfg = 0, ffg = 0, sfg = 0, slfg = 0, lfg = 0, u1 = 0, u2 = 0, i = 0;
+                while (filePosition < fzd.Length && i < numberOfProgramFiles)
+                {
+                    var pf = new PLCFileDetails
+                    {
+                        FileType = fzd[filePosition],
+                        NumberOfBytes = fzd[filePosition + 1] + fzd[filePosition + 2] * 256
+                    };
+
+                    if (pf.FileType >= 0x40 && pf.FileType <= 0x5F) pf.FileNumber = sfg++;
+                    else if (pf.FileType >= 0x20 && pf.FileType <= 0x3F) pf.FileNumber = lfg++;
+                    else if (pf.FileType >= 0x60 && pf.FileType <= 0x7F) pf.FileNumber = slfg++;
+                    else if (pf.FileType >= 0x80 && pf.FileType <= 0x9F) pf.FileNumber = dfg++;
+                    else if (pf.FileType >= 0xA0 && pf.FileType <= 0xBF) pf.FileNumber = ffg++;
+                    else if (pf.FileType >= 0xC0 && pf.FileType <= 0xDF) pf.FileNumber = u1++;
+                    else if (pf.FileType >= 0xE0 && pf.FileType <= 0xFF) pf.FileNumber = u2++;
+
+                    var addr = new DataAddress { FileType = pf.FileType, FileNumber = pf.FileNumber };
+                    if (pf.NumberOfBytes > 0)
+                    {
+                        pf.Data = ReadRawData(addr, pf.NumberOfBytes, out int reply);
+                        if (reply != 0)
+                            throw new DF1Exception("Failed to Read Program File " + addr.FileNumber +
+                                                   ", Type " + addr.FileType + " - " + MessageDecoder.DecodeMessage(reply));
+                    }
+                    else pf.Data = Array.Empty<byte>();
+
+                    programFiles.Add(pf);
+                    UploadProgress?.Invoke(this, EventArgs.Empty);
+                    i++;
+                    filePosition += (ProcessorType == 0x25 || ProcessorType == 0x58) ? 8 : 10;
+                }
+                return programFiles;
+            }
+            finally
+            {
+                DisableEvent = false;
+            }
+        }
+
+        public void DownloadProgramData(Collection<PLCFileDetails> plcFiles)
+        {
+            // Suppress DataReceived events during download
+            DisableEvent = true;
+            try
+            {
+                SetProgramMode();
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                int dataLength = (ProcessorType == 0x5B || ProcessorType == 0x78) ? 13 : 15;
+                byte[] data = new byte[dataLength + 1];
+                data[0] = 0x02; data[1] = 0x0A; data[2] = 0xAA;
+                data[3] = 4; data[4] = 0; data[5] = 0x63;
+
+                int idx = 0;
+                while (idx < plcFiles.Count && (plcFiles[idx].FileNumber != 0 || plcFiles[idx].FileType != 0x24)) idx++;
+                if (idx < plcFiles.Count && plcFiles[idx].Data?.Length >= 8)
+                {
+                    data[8] = plcFiles[idx].Data[2]; data[9] = plcFiles[idx].Data[3];
+                    data[10] = plcFiles[idx].Data[4]; data[11] = plcFiles[idx].Data[5];
+                    if (dataLength > 14) { data[12] = plcFiles[idx].Data[6]; data[13] = plcFiles[idx].Data[7]; }
+                }
+
+                var pAddr = new DataAddress();
+                switch (ProcessorType)
+                {
+                    case 0x78:
+                    case 0x5B:
+                    case 0x49:
+                        pAddr.FileType = 0x63; pAddr.Element = 0;
+                        byte[] four = ReadRawData(pAddr, 4, out int r4);
+                        if (r4 != 0) throw new DF1Exception("Failed to Read File 0, Type 63h - " + MessageDecoder.DecodeMessage(r4));
+                        Array.Copy(four, 0, data, 8, 4);
+                        pAddr.FileType = 1; pAddr.Element = 0x23;
+                        data[1] = 0x0A; data[3] = 4;
+                        break;
+                    case 0x88:
+                    case 0x89:
+                    case 0x8C:
+                    case 0x9C:
+                        data[1] = 0x0C; data[3] = 6;
+                        pAddr.FileType = 2; pAddr.Element = 0x23;
+                        break;
+                    default:
+                        data[1] = 0x0A; data[3] = 4;
+                        pAddr.FileType = 1; pAddr.Element = 0x23;
+                        break;
+                }
+
+                data[data.Length - 2] = 1;
+                data[data.Length - 1] = 0x56;
+
+                int reply = PrefixAndSend(0xF, 0x88, data, true, out _);
+                if (reply != 0) throw new DF1Exception("Failed to Initialize for Download - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                byte[] empty = Array.Empty<byte>();
+
+                reply = PrefixAndSend(0xF, 0x11, empty, true, out _);
+                if (reply != 0) throw new DF1Exception("Failed to Secure Sole Access - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                pAddr.BitNumber = 16;
+                byte[] data3 = { (byte)(plcFiles[0].Data.Length & 0xFF), (byte)((plcFiles[0].Data.Length >> 8) & 0xFF) };
+                reply = WriteRawData(pAddr, 2, data3);
+                if (reply != 0) throw new DF1Exception("Failed to Write Directory Length - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                pAddr.Element = 0;
+                reply = WriteRawData(pAddr, plcFiles[0].Data.Length, plcFiles[0].Data);
+                if (reply != 0) throw new DF1Exception("Failed to Write New Program Directory - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                for (int i = 1; i < plcFiles.Count; i++)
+                {
+                    pAddr.FileNumber = plcFiles[i].FileNumber; pAddr.FileType = plcFiles[i].FileType;
+                    pAddr.Element = 0; pAddr.SubElement = 0;
+                    pAddr.BitNumber = 16;
+                    reply = WriteRawData(pAddr, plcFiles[i].Data.Length, plcFiles[i].Data);
+                    if (reply != 0) throw new DF1Exception("Failed when writing files to PLC - " + MessageDecoder.DecodeMessage(reply));
+                    DownloadProgress?.Invoke(this, EventArgs.Empty);
+                }
+
+                reply = PrefixAndSend(0xF, 0x52, empty, true, out _);
+                if (reply != 0) throw new DF1Exception("Failed to Indicate to PLC that Download is complete - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                reply = PrefixAndSend(0xF, 0x12, empty, true, out _);
+                if (reply != 0) throw new DF1Exception("Failed to Release Sole Access - " + MessageDecoder.DecodeMessage(reply));
+                DownloadProgress?.Invoke(this, EventArgs.Empty);
+            }
+            finally
+            {
+                DisableEvent = false;
+            }
+        }
+
+        // ─── Auto-detect ─────────────────────────────────────────────────────────
+        public int DetectCommSettings()
+        {
+            DisableEvent = true;
+            try
+            {
+                int[] baudRates = { 38400, 19200, 9600 };
+                var parities = new System.IO.Ports.Parity[] { System.IO.Ports.Parity.None, System.IO.Ports.Parity.Even };
+                var checksums = new CheckSumOptions[] { CheckSumOptions.Crc, CheckSumOptions.Bcc };
+
+                int reply = -1;
+                int maxTicksBackup = dataLink.MaxTicks;
+                dataLink.MaxTicks = 3;
+                bool portError = false;
+
+                foreach (int baud in baudRates)
+                {
+                    if (reply == 0 || portError) break;
+                    foreach (var parity in parities)
+                    {
+                        if (reply == 0 || portError) break;
+                        foreach (var cs in checksums)
+                        {
+                            CloseComms();
+                            dataLink.ResetSleepDelay();
+                            m_BaudRate = baud; m_Parity = parity; CheckSum = cs;
+                            AutoDetectTry?.Invoke(this, EventArgs.Empty);
+                            reply = SendENQ();
+                            if (reply == -6) { portError = true; break; }
+                            dataLink.MaxTicks++;
+                            if (reply == 0) break;
+                        }
+                    }
+                }
+
+                dataLink.MaxTicks = maxTicksBackup;
+                return reply;
+            }
+            finally
+            {
+                DisableEvent = false;
+            }
+        }
+
+        // ─── Comms ────────────────────────────────────────────────────────────────
+        public int OpenComms()
+        {
+            try
+            {
+                dataLink.Open();
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                throw new DF1Exception("Failed To Open " + m_ComPort + ". " + ex.Message);
+            }
+        }
+
+        public void CloseComms()
+        {
+            dataLink.Close();
+        }
+
+        // ─── String helpers ───────────────────────────────────────────────────────
+        public static string WordsToString(int[] words) => StringConverter.WordsToString(words);
+        public static string WordsToString(int[] words, int index) => StringConverter.WordsToString(words, index);
+        public static string WordsToString(int[] words, int index, int count) => StringConverter.WordsToString(words, index, count);
+        public static int[]? StringToWords(string source) => StringConverter.StringToWords(source);
+
+        // =========================================================================
+        // PRIVATE METHODS (identical to original but using builder and dataLink)
+        // =========================================================================
+
+        private void IncrementTNS() => TNS = TNS < 65535 ? (ushort)(TNS + 1) : (ushort)1;
+
+        private int PrefixAndSend(int command, int func, byte[] data, bool wait, out int rTNS)
+        {
+            IncrementTNS();
+            byte[] pkt = PacketBuilder.BuildCommandWithData(command, func, data, TNS, MyNode, TargetNode, Protocol == "DF1");
+            rTNS = TNS & 0xFF;
+            Interlocked.Exchange(ref Responded[rTNS], 0);
+
+            int result;
+            if (Protocol == "DF1")
+            {
+                result = SendData(pkt);
+            }
+            else
+            {
+                if (!dataLink.IsPortOpen) OpenComms();
+                QueuedCommand.Clear();
+                foreach (byte b in pkt) QueuedCommand.Add(b);
+                CommandInQueue = true;
+                result = 0;
+            }
+
+            if (result == 0 && wait)
+            {
+                result = WaitForResponse(rTNS);
+                if (result == 0)
+                {
+                    if (DataPackets.TryGetValue(rTNS, out byte[]? rxPkt))
+                    {
+                        if (Protocol == "DF1")
+                        {
+                            if (rxPkt.Length > 3)
+                            {
+                                result = rxPkt[3];
+                                if (result == 0xF0)
+                                    result = rxPkt[rxPkt.Length - 1] + 0x100;
+                            }
+                        }
+                        else if (rxPkt.Length > 7)
+                            result = rxPkt[7];
+                    }
+                    else result = -8;
+                }
+            }
+            return result;
+        }
+
+        private int SendData(byte[] pdu)
+        {
+            // Use DataLink to send the PDU (without DLE stuffing etc.)
+            int result = dataLink.SendFrame(pdu, waitForAck: true);
+            // Update local SleepDelay from DataLink (for backoff)
+            SleepDelay = dataLink.SleepDelay;
+            return result;
+        }
+
+        private int SendResponse(int command, int rTNS)
+        {
+            byte[] pkt = PacketBuilder.BuildCommandWithData(command, 0, Array.Empty<byte>(), (ushort)rTNS, MyNode, TargetNode, Protocol == "DF1");
+            return dataLink.SendFrame(pkt, waitForAck: false);
+        }
+
+        private int WaitForResponse(int rTNS)
+        {
+            int loops = 0;
+            const int maxLoops = 100;
+            while (Interlocked.CompareExchange(ref Responded[rTNS], 0, 0) == 0 && loops < maxLoops)
+            {
+                Thread.Sleep(20);
+                loops++;
+            }
+            if (loops >= maxLoops) return -20;
+            if (dataLink.LastResponseWasNAK) return -21;
+            return 0;
+        }
+
+        private int SendENQ()
+        {
+            // Use DataLink to send ENQ and wait for ACK/NAK using polling (like original)
+            dataLink.SendControl(0x05);
+            int waitTicks = 0;
+            const int maxTicks = 100;
+            bool acked = false, nacked = false;
+            // We need to poll DataLink's internal flags. DataLink exposes AcknowledgedFlag and NotAcknowledgedFlag.
+            // We'll add simple properties to DataLink.
+            while (!acked && !nacked && waitTicks < maxTicks)
+            {
+                Thread.Sleep(20);
+                acked = dataLink.AcknowledgedFlag;
+                nacked = dataLink.NotAcknowledgedFlag;
+                waitTicks++;
+            }
+            // Reset flags
+            dataLink.ResetAckNakFlags();
+            if (acked) return 0;
+            if (nacked) return -2;
+            return -3;
+        }
+
+        private byte[] ReadRawData(DataAddress pAddr, int numberOfBytes, out int reply)
+        {
+            reply = 0;
+            int filePosition = 0;
+            byte[] result = new byte[numberOfBytes];
+
+            while (filePosition < numberOfBytes && reply == 0)
+            {
+                int toRead = numberOfBytes - filePosition < 236 ? numberOfBytes - filePosition : 236;
+                if (toRead > 168 && pAddr.FileType == 0x8D) toRead = 168;
+                if (toRead > 234 && (pAddr.FileType == 0x86 || pAddr.FileType == 0x87)) toRead = 234;
+                if (toRead > 0x78 && pAddr.FileType == 0xA4) toRead = 0x78;
+                if (toRead > 0x50 && ProcessorType == 0x25) toRead = 0x50;
+                if (toRead <= 0) break;
+
+                // Use PacketBuilder to create the read body
+                byte[] body = PacketBuilder.BuildReadRequestBody(pAddr, toRead, out int func);
+                reply = PrefixAndSend(0xF, func, body, true, out int rTNS);
+                if (reply == 0 && DataPackets.TryGetValue(rTNS, out byte[]? pkt))
+                {
+                    for (int i = 0; i < toRead && (i + 6) < pkt.Length; i++)
+                        result[filePosition + i] = pkt[i + 6];
+                }
+
+                filePosition += toRead;
+                if (pAddr.FileType == 0xA4) pAddr.Element += toRead / 0x28;
+                else pAddr.SubElement += toRead / 2;
+            }
+            return result;
+        }
+
+        private int WriteRawData(DataAddress p, int numberOfBytes, byte[] dataToWrite)
+        {
+            if (p.FileType == 0) return -5;
+            int filePosition = 0, reply = 0;
+
+            while (filePosition < numberOfBytes && reply == 0)
+            {
+                int toWrite = numberOfBytes - filePosition < 164 ? numberOfBytes - filePosition : 164;
+                if (p.FileType >= 0xA1 && toWrite > 0x78) toWrite = 0x78;
+
+                byte[] body = PacketBuilder.BuildWriteRequestBody(p, dataToWrite, filePosition, toWrite, out int func);
+                reply = PrefixAndSend(0xF, func, body, !AsyncMode, out _);
+                filePosition += toWrite;
+                if (p.FileType != 0xA4) p.SubElement += toWrite / 2;
+                else p.Element += toWrite / 0x28;
+            }
+
+            if (reply == 0) return 0;
+            throw new DF1Exception(MessageDecoder.DecodeMessage(reply));
+        }
+
+        private byte[] ReadFileDirectory()
+        {
+            GetProcessorType();
+            var pAddr = new DataAddress();
+            switch (ProcessorType)
+            {
+                case 0x25: case 0x58: pAddr.FileType = 0; pAddr.Element = 0x23; break;
+                case 0x88: case 0x89: case 0x8C: case 0x9C: pAddr.FileType = 2; pAddr.Element = 0x2F; break;
+                default: pAddr.FileType = 1; pAddr.Element = 0x23; break;
+            }
+
+            byte[] data = ReadRawData(pAddr, 2, out int reply);
+            if (reply != 0) throw new DF1Exception("Failed to Get Program Directory Size - " + MessageDecoder.DecodeMessage(reply));
+
+            pAddr.Element = 0;
+            int size = data[0] + data[1] * 256;
+            byte[] fzd = ReadRawData(pAddr, size, out reply);
+            if (reply != 0) throw new DF1Exception("Failed to Get Program Directory - " + MessageDecoder.DecodeMessage(reply));
+            return fzd;
+        }
+
+        private static int FileTypeToBytesPerElement(byte code, out string fileTypeStr)
+        {
+            switch (code)
+            {
+                case 0x82: case 0x8B: fileTypeStr = "O"; return 2;
+                case 0x83: case 0x8C: fileTypeStr = "I"; return 2;
+                case 0x84: fileTypeStr = "S"; return 2;
+                case 0x85: fileTypeStr = "B"; return 2;
+                case 0x86: fileTypeStr = "T"; return 6;
+                case 0x87: fileTypeStr = "C"; return 6;
+                case 0x88: fileTypeStr = "R"; return 6;
+                case 0x89: fileTypeStr = "N"; return 2;
+                case 0x8A: fileTypeStr = "F"; return 4;
+                case 0x8D: fileTypeStr = "ST"; return 84;
+                case 0x8E: fileTypeStr = "A"; return 2;
+                case 0x91: fileTypeStr = "L"; return 4;
+                case 0x92: fileTypeStr = "MG"; return 50;
+                case 0x93: fileTypeStr = "PD"; return 46;
+                case 0x94: fileTypeStr = "PLS"; return 12;
+                default: fileTypeStr = "Undefined"; return 2;
+            }
+        }
+
+        // =========================================================================
+        // DATA LINK EVENT HANDLERS
+        // =========================================================================
+
+        private void DataLink_PacketReceived(object? sender, byte[] pdu)
+        {
+            // Filter for DH485 – discard packets not addressed to MyNode
+            if (Protocol != "DF1" && pdu.Length > 0)
+            {
+                // For DH485, first byte is DST (destination node + 0x80)
+                int dst = pdu[0] & 0x7F; // strip the 0x80 bit
+                if (dst != MyNode)
+                    return; // not for us, ignore
+            }
+
+            // Determine TNS
+            int xTNS = 0;
+            if (Protocol == "DF1")
+            {
+                if (pdu.Length > 4 && pdu[2] > 31)
+                    xTNS = pdu[4];
+            }
+            else
+            {
+                if (pdu.Length > 8)
+                    xTNS = pdu[8];
+            }
+
+            // Atomically replace the packet reference. Reading threads snapshot the reference
+            // via TryGetValue, so they are never exposed to a partially-written collection.
+            DataPackets[xTNS] = pdu;
+
+            // Signal waiting thread (original used Responded array)
+            Interlocked.Exchange(ref Responded[xTNS], 1);
+
+            // Handle unsolicited messages and DH485 (exactly as original)
+            if (Protocol == "DF1")
+            {
+                if (pdu.Length > 2 && pdu[2] > 31)
+                {
+                    // Raise DataReceived only if DisableEvent is false
+                    if (!DisableEvent)
+                        DataReceived?.Invoke(this, EventArgs.Empty);
+                }
+                else if (pdu.Length > 6 && pdu[2] == 15 && pdu[6] == 0xAA)
+                {
+                    int tns = pdu[5] * 256 + pdu[4];
+                    SendResponse(pdu[2] + 0x40, tns);
+                    UnsolictedMessageRcvd?.Invoke(this, EventArgs.Empty); // never suppressed
+                }
+            }
+            else
+            {
+                // DH485 logic (identical to original, with DisableEvent check for DataReceived)
+                if (pdu.Length > 1 && pdu[1] == 0x18)
+                {
+                    IncrementTNS();
+                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                    dataLink.SendFrame(resp, waitForAck: false);
+                    PacketOpened = true; CommandInQueue = false;
+                }
+                if (pdu.Length > 1 && pdu[1] > 0 && pdu[1] != 0x18)
+                {
+                    IncrementTNS();
+                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0x18, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                    dataLink.SendFrame(resp, waitForAck: false);
+                    PacketOpened = true;
+                    if (pdu.Length > 1 && pdu[1] > 1 && (pdu[1] & 31) == 0x08)
+                    {
+                        // Suppress DataReceived if DisableEvent is true
+                        if (!DisableEvent)
+                            DataReceived?.Invoke(this, EventArgs.Empty);
+                    }
+                }
+                if (pdu.Length > 1 && pdu[1] == 0)
+                {
+                    if (!CommandInQueue || PacketOpened)
+                    {
+                        byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                        dataLink.SendFrame(resp, waitForAck: false);
+                        PacketOpened = false;
+                    }
+                    else
+                    {
+                        byte[] qc = new byte[QueuedCommand.Count];
+                        QueuedCommand.CopyTo(qc, 0);
+                        dataLink.SendFrame(qc, waitForAck: false);
+                    }
+                }
+            }
+        }
+
+        private void DataLink_EnqReceived(object? sender, EventArgs e)
+        {
+            // Respond with ACK if last response was not NAK, else NAK (identical to original)
+            dataLink.SendControl(dataLink.LastResponseWasNAK ? (byte)0x15 : (byte)0x06);
+        }
+
+        // ─── IDisposable ─────────────────────────────────────────────────────────
+        public void Dispose()
+        {
+            dataLink?.Dispose();
+        }
+    }
+}

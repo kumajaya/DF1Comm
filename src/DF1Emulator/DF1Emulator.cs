@@ -1,0 +1,1120 @@
+using System;
+using System.Collections.Generic;
+using System.IO.Ports;
+using System.Linq;
+using System.Threading;
+
+/// <summary>
+/// DF1 Full-Duplex SLC 5/03 emulator, compatible with both RSLinx auto-browse
+/// and the DF1Comm library client.
+///
+/// Frame format (both directions):
+///   DLE STX | DST SRC CMD STS TNS_LO TNS_HI [FUNC] [DATA...] | DLE ETX | CHK
+///
+/// RSLinx auto-configure sequence:
+///   1. ENQ (DLE 0x05)              → emulator replies ACK (DLE 0x06)
+///   2. Get Diagnostic Status
+///      (CMD=0x06, FNC=0x03)        → emulator replies with 24-byte status payload
+///   3. Reset (CMD=0x01)            → emulator acknowledges the reset
+///   4. Set Variables (CMD=0x0B)    → emulator acknowledges; no parameters changed
+///
+/// Response frame conventions:
+///   - CMD 0x06 Get Status  : WITHOUT FUNC byte — DF1Comm reads ProcessorType
+///                            from DataPackets[rTNS][9] = inner[9] = DATA[3] = 0x49.
+///   - CMD 0x06 echo        : WITH FUNC byte (reflects data back unchanged).
+///   - CMD 0x0F Read/Write  : WITHOUT FUNC byte — DF1Comm reads returned data
+///                            starting at DataPackets[rTNS][6] = inner[6] = DATA[0].
+///   - CMD 0x01 Reset       : WITH FUNC byte.
+///   - Error responses      : WITH FUNC byte (cmd | 0x40, non-zero STS).
+///
+/// Checksum: BCC (1 byte) or CRC (2 bytes little-endian). Calculated over the
+///           unstuffed payload only — CalculateChecksum appends ETX (0x03)
+///           internally, so the caller must NOT pre-append DLE+ETX.
+///
+/// Key implementation notes:
+///   - PlcMemory is thread-safe (lock inside ReadRaw/Write).
+///   - Frame parsing skips stuffed DLE pairs (0x10 0x10) to avoid false DLE ETX
+///     detection when payload contains 0x10 bytes.
+///   - Extended element addressing (element >= 255) is decoded correctly.
+///   - _lastLog is an instance field; LogDelta is protected by _logLock to prevent
+///     race between DataReceived and timer threads.
+///   - Diagnostic counters are read with Interlocked.CompareExchange for consistency
+///     with Interlocked.Increment writes.
+///
+/// SLC 5/03 compliance (Publication 1770-6.5.16):
+///   - GetStatus byte 0 (mode/status flags) uses bits 6-7 only (edits active);
+///     mode code is placed in bytes 18-19 as per Chapter 10 table.
+///   - GetStatus catalog string is "5/03" per specification.
+///   - GetStatus RAM size is 0x10 (16K words for 1747-L532E).
+///   - GetStatus byte 24 added: directory corrupted flag + program owner.
+///   - CMD 0x06 FNC 0x01 (read diagnostic counters) reply CMD is 0x46
+///     (not 0x4A, which is the reply for CMD 0x0A).
+///   - CMD 0x06 FNC 0x07 (reset diagnostic counters) resets all counters to zero
+///     and replies with CMD 0x46 and no data.
+///   - Change mode (CMD 0x0F FNC 0x80): modes 0x07/0x08/0x09 (TEST) are tracked
+///     via _processorMode enum; status response reflects correct mode code per spec
+///     (0x1E=RUN, 0x11=PROG, 0x17=TEST-Cont, etc.).
+///
+/// Additional SLC 5/03 compliance (AB Application Note, March 1995 + SLCCCD Rev 1.0):
+///   - Diagnostic counters DF1 Full-Duplex layout follows the AB Application Note
+///     (page 17) layout for "DF1 Full-Duplex size <=40 bytes":
+///       Bytes 8-9   = ENQ packets sent (not "retried")
+///       Bytes 10-11 = NAK packets received (not "normal poll last scan")
+///       Bytes 12-13 = ENQ packets received (not "normal poll max scan")
+///       Bytes 16-17 = no buffer space / NAK'd (not "unused 0x0000")
+///       Bytes 20-27 = 00h unused × 8 (poll scan time fields removed — DF1 only)
+///       Total response extended to 34 bytes (modem status + 32 counter bytes).
+///   - CMD 0x0F FNC 0x94 (Read File Info) handler added.
+///     Returns file size (4 bytes), element count (2 bytes), reserved, data type.
+///   - CMD 0x0F FNC 0xAB (Bit Write): when target file type is I/O image
+///     (0x8B output-by-slot, 0x8C input-by-slot), mask is ignored and data
+///     is written directly per SLCCCD section 4.36 operation note.
+/// </summary>
+public class DF1Emulator : IDisposable
+{
+    private readonly SerialPort _port;
+    private readonly List<byte> _rx = new List<byte>();
+    private readonly object _rxLock = new object();
+    private readonly object _txLock = new object();
+    private readonly PlcMemory _memory;
+
+    public CheckSumOptions CheckSum { get; set; } = CheckSumOptions.Bcc;
+    public int MyNode { get; set; } = 1;
+
+    // Full processor mode tracking per Publication 1770-6.5.16 Chapter 10.
+    // Mode code stored in bits 0-4 of byte 19 in GetStatus response.
+    //   Local:  0x11=PROG, 0x1E=RUN
+    //   Remote: 0x01=PROG, 0x06=RUN
+    //   Test:   0x17=Cont, 0x18=Single, 0x19=Step
+    private enum ProcessorMode : byte
+    {
+        LocalProg   = 0x11,
+        RemoteProg  = 0x01,
+        LocalRun    = 0x1E,
+        RemoteRun   = 0x06,
+        TestCont    = 0x17,
+        TestSingle  = 0x18,
+        TestStep    = 0x19,
+    }
+    private ProcessorMode _processorMode = ProcessorMode.LocalRun;
+    private bool IsRunMode => _processorMode == ProcessorMode.LocalRun ||
+                              _processorMode == ProcessorMode.RemoteRun;
+
+    // Instance field for logging timestamp, with lock to avoid race between DataReceived and timer threads
+    private DateTime _lastLog = DateTime.Now;
+    private readonly object _logLock = new object();
+
+    // ─── Diagnostic counters ─────────────────────────────────────────────────
+    // Layout matches AB Application Note (1995) "DF1 Full-Duplex size <=40 bytes" table.
+    // bytes 8-9 = ENQ sent, 10-11 = NAK received, 12-13 = ENQ received,
+    // 16-17 = no buffer NAK'd. Bytes 20-27 = all 0x00 (DF1 full-duplex has no poll scan time fields).
+    private int _totalPacketsSent         = 0;
+    private int _totalPacketsReceived     = 0;
+    private int _undeliveredPackets       = 0;
+    private int _enqSent                  = 0;
+    private int _nakReceived              = 0;
+    private int _enqReceived              = 0;
+    private int _badPacketsDetected       = 0;
+    private int _noBufferNakd             = 0;
+    private int _duplicatePacketsReceived = 0;
+    private int _dcdRecoveryCount         = 0;
+    private int _lostModemCount           = 0;
+    private ushort _modemStatus = 0x001F;
+    private Timer _timer;
+    private Timer _waveformTimer;
+    private volatile bool _isDisposing = false;
+
+    // ─── Constructor ─────────────────────────────────────────────────────────
+    /// <summary>
+    /// Initializes the emulator but does not open the serial port.
+    /// Timer is created but not started; it will be started in Start().
+    /// </summary>
+    public DF1Emulator(string portName, int baudRate, Parity parity)
+    {
+        _port = new SerialPort(portName, baudRate, parity, 8, StopBits.One)
+        {
+            ReadTimeout = 500,
+            WriteTimeout = 500
+        };
+        _port.DataReceived += Port_DataReceived;
+        _memory = new PlcMemory();
+        // Create timer but do not start it yet – start it in Start() after port is open.
+        _timer = new Timer(_ => UpdateDateTime(), null, Timeout.Infinite, Timeout.Infinite);
+        _waveformTimer = new Timer(_ => UpdateWaveform(), null, Timeout.Infinite, Timeout.Infinite);
+        UpdateProcessorMode();
+    }
+
+    private void UpdateDateTime()
+    {
+        var now = DateTime.Now;
+
+        // S2:37 = YYYY, S2:38 = MM, S2:39 = DD
+        // S2:40 = HH,   S2:41 = MM, S2:42 = SS
+        // PlcMemory.Write is thread-safe, so concurrent timer + receive is safe.
+        // Only update time registers when in RUN mode — processor clock advances in RUN.
+        if (!IsRunMode) return;
+        _memory.Write(0x84, 2, 37, 0, 2, BitConverter.GetBytes((short)now.Year));
+        _memory.Write(0x84, 2, 38, 0, 2, BitConverter.GetBytes((short)now.Month));
+        _memory.Write(0x84, 2, 39, 0, 2, BitConverter.GetBytes((short)now.Day));
+        _memory.Write(0x84, 2, 40, 0, 2, BitConverter.GetBytes((short)now.Hour));
+        _memory.Write(0x84, 2, 41, 0, 2, BitConverter.GetBytes((short)now.Minute));
+        _memory.Write(0x84, 2, 42, 0, 2, BitConverter.GetBytes((short)now.Second));
+    }
+
+    private void UpdateProcessorMode()
+    {
+        // S2:1 = file type 0x84, file number 2, element 1 (word offset 1), 2 bytes
+        // Read current word to preserve high byte (bit flags)
+        byte[] current = _memory.ReadRaw(0x84, 2, 2, 2, out int status);
+        if (status == 0 && current.Length == 2)
+        {
+            // Low byte = mode code (bits 0-4), high byte unchanged
+            current[0] = (byte)_processorMode;
+            _memory.Write(0x84, 2, 1, 0, 2, current);
+        }
+    }
+
+    /// <summary>
+    /// Periodically updates F8:0 (sine wave) and F8:1 (triangle wave) based on real-time.
+    /// This ensures waveform continuity even after disconnection/reconnection.
+    /// </summary>
+    private void UpdateWaveform()
+    {
+        if (!IsRunMode) return;
+
+        // F8:0 - Sine wave (amplitude 100, period 2 seconds)
+        double now = DateTime.UtcNow.TimeOfDay.TotalSeconds;
+        double sinePhase = (now % 2.0) / 2.0 * (2.0 * Math.PI);
+        float sineValue = (float)(100.0 * Math.Sin(sinePhase));
+        _memory.Write(0x8A, 8, 0, 0, 4, BitConverter.GetBytes(sineValue));
+
+        // F8:1 - Triangle wave (amplitude 100, period 4 seconds)
+        double t = now % 4.0;
+        float triValue;
+        if (t < 2.0)
+            triValue = (float)(-100.0 + (t / 2.0) * 200.0);
+        else
+            triValue = (float)(100.0 - ((t - 2.0) / 2.0) * 200.0);
+        _memory.Write(0x8A, 8, 1, 0, 4, BitConverter.GetBytes(triValue));
+    }
+
+    /// <summary>
+    /// Opens the serial port and starts the emulator.
+    /// Timer is started after port is successfully opened.
+    /// </summary>
+    public void Start()
+    {
+        if (!SerialPort.GetPortNames().Contains(_port.PortName, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Port '{_port.PortName}' not found. Available ports: {string.Join(", ", SerialPort.GetPortNames())}");
+        }
+        
+        try
+        {
+            _port.Open();
+            _port.DiscardInBuffer();
+            UpdateModemStatus();
+            // Start the periodic timer for S2 date/time registers
+            _timer.Change(0, 1000);
+            // Start the waveform timer
+            _waveformTimer.Change(0, 500);
+            Console.WriteLine($"DF1 Emulator started on {_port.PortName}...");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new Exception($"Port '{_port.PortName}' is busy. Details: {ex.Message}");
+        }
+        catch (Exception ex) 
+        {
+            throw new Exception($"Failed to open port {_port.PortName}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Stops the emulator, closes the serial port, and disposes resources.
+    /// Thread-safe and designed to prevent deadlocks with DataReceived.
+    /// </summary>
+    public void Stop()
+    {
+        _isDisposing = true;
+        
+        // Stop the timer so no further callbacks occur
+        _timer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _waveformTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        
+        // Unsubscribe event handler to prevent new callbacks
+        _port.DataReceived -= Port_DataReceived;
+        
+        // Allow any in-flight DataReceived event to finish
+        Thread.Sleep(50);
+        
+        try
+        {
+            if (_port.IsOpen)
+                _port.Close();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during shutdown: {ex.Message}");
+        }
+    }
+
+    public void Dispose()
+    {
+        Stop();
+        _timer?.Dispose();
+        _waveformTimer?.Dispose();
+        _port?.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    // ─── Serial receive (no offload – must respond quickly to ACK/NAK) ───────
+    private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+    {
+        // Ignore any data if we are shutting down
+        if (_isDisposing) return;
+        
+        try
+        {
+            int toRead = _port.BytesToRead;
+            if (toRead <= 0) return;
+            byte[] buf = new byte[toRead];
+            int r = _port.Read(buf, 0, toRead);
+            if (r > 0)
+            {
+                lock (_rxLock)
+                {
+                    _rx.AddRange(buf.Take(r));
+                    ParseBuffer();
+                }
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // Port already closed during shutdown – ignore silently
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Port_DataReceived error: {ex.Message}");
+        }
+    }
+
+    // ─── Frame parser ─────────────────────────────────────────────────────────
+    private void ParseBuffer()
+    {
+        int chkBytes = CheckSum == CheckSumOptions.Bcc ? 1 : 2;
+        int i = 0;
+
+        while (i < _rx.Count)
+        {
+            // Handle standalone ENQ (DLE 0x05) — RSLinx auto-configure node probe
+            if (i + 1 < _rx.Count && _rx[i] == 0x10 && _rx[i + 1] == 0x05)
+            {
+                _rx.RemoveRange(i, 2);
+                HandleEnq();
+                i = 0;
+                continue;
+            }
+
+            // Look for DLE STX frame start
+            if (i + 1 < _rx.Count && _rx[i] == 0x10 && _rx[i + 1] == 0x02)
+            {
+                // Scan for DLE ETX, skipping over stuffed 0x10 0x10 pairs in the payload.
+                int etxIndex = -1;
+                for (int j = i + 2; j + 1 < _rx.Count; j++)
+                {
+                    if (_rx[j] == 0x10 && _rx[j + 1] == 0x10) { j++; continue; }
+                    if (_rx[j] == 0x10 && _rx[j + 1] == 0x03) { etxIndex = j; break; }
+                }
+
+                if (etxIndex == -1) break; // incomplete frame — wait for more bytes
+
+                int lastChkIndex = etxIndex + 1 + chkBytes;
+                if (lastChkIndex >= _rx.Count) break; // checksum bytes not yet received
+
+                int frameLen = lastChkIndex - i + 1;
+                byte[] frame = _rx.Skip(i).Take(frameLen).ToArray();
+                _rx.RemoveRange(i, frameLen);
+                ProcessFrame(frame);
+                i = 0;
+            }
+            else i++;
+        }
+
+        // Discard bytes that were scanned and cannot start a valid frame
+        if (i > 0)
+            _rx.RemoveRange(0, i);
+
+        // Prevent unbounded growth from line noise
+        if (_rx.Count > 8192) _rx.RemoveRange(0, _rx.Count - 4096);
+    }
+
+    // ─── ENQ handler ─────────────────────────────────────────────────────────
+    private void HandleEnq()
+    {
+        // DLE ENQ (0x10 0x05): node-presence probe sent by RSLinx during auto-configure.
+        // Reply with DLE ACK (0x10 0x06) to confirm this node is alive.
+        Interlocked.Increment(ref _enqReceived); // track ENQ packets received
+        SendAck();
+    }
+
+    // ─── Frame processor ─────────────────────────────────────────────────────
+    private void ProcessFrame(byte[] rawFrame)
+    {
+        try
+        {
+            int chkBytes = CheckSum == CheckSumOptions.Bcc ? 1 : 2;
+            if (rawFrame.Length < 6 + chkBytes) return;
+
+            // Extract received checksum (little-endian for CRC)
+            ushort receivedChk = chkBytes == 1
+                ? rawFrame[rawFrame.Length - 1]
+                : (ushort)(rawFrame[rawFrame.Length - 2] | (rawFrame[rawFrame.Length - 1] << 8));
+
+            // Locate DLE ETX while skipping stuffed 0x10 0x10 pairs to avoid false detection.
+            int etxPos = -1;
+            for (int i = 2; i < rawFrame.Length - 1; i++)
+            {
+                if (rawFrame[i] == 0x10 && rawFrame[i + 1] == 0x10) { i++; continue; }
+                if (rawFrame[i] == 0x10 && rawFrame[i + 1] == 0x03) { etxPos = i; break; }
+            }
+            if (etxPos == -1) return;
+
+            // Unstuff the payload (bytes between DLE STX and DLE ETX)
+            int payloadLen = etxPos - 2;
+            if (payloadLen <= 0) return;
+            byte[] stuffed = new byte[payloadLen];
+            Array.Copy(rawFrame, 2, stuffed, 0, payloadLen);
+            byte[] unstuffed = MessageDecoder.RemoveDleStuffing(stuffed);
+            if (unstuffed.Length < 6) return;
+
+            // Verify checksum over the unstuffed payload only.
+            // CalculateChecksum appends ETX internally, matching SendRawFrame.
+            ushort calc = MessageDecoder.CalculateChecksum(unstuffed, CheckSum);
+            if (calc != receivedChk)
+            {
+                Console.WriteLine($"Checksum mismatch: calc=0x{calc:X4} recv=0x{receivedChk:X4} ({CheckSum})");
+                Interlocked.Increment(ref _badPacketsDetected);
+                Interlocked.Increment(ref _undeliveredPackets);
+                SendNak();
+                return;
+            }
+
+            // Valid packet received
+            Interlocked.Increment(ref _totalPacketsReceived);
+
+            int dst  = unstuffed[0];
+            int src  = unstuffed[1];
+            int cmd  = unstuffed[2];
+            // unstuffed[3] = STS (not used by emulator)
+            int tns  = unstuffed[4] | (unstuffed[5] << 8);
+
+            // FUNC byte is optional – only present if unstuffed.Length >= 7
+            int func = (unstuffed.Length >= 7) ? unstuffed[6] : 0;
+            byte[] data = (unstuffed.Length > 7) ? unstuffed.Skip(7).ToArray() : Array.Empty<byte>();
+
+            LogDelta($"\n    RX: ");
+            foreach (byte b in rawFrame) Console.Write($"{b:X2} ");
+            Console.WriteLine();
+            Console.WriteLine($"    dst={dst} src={src} cmd=0x{cmd:X2} tns={tns} func=0x{func:X2} dataLen={data.Length}");
+
+            if (dst != MyNode && dst != 0xFF) return;
+
+            // ACK before responding — required by DF1 full-duplex protocol.
+            SendAck();
+
+            // Dispatch on CMD (and FUNC where CMD alone is ambiguous)
+            if (cmd == 0x06 && func == 0x00)
+                // Diagnostic Loop – RSLinx auto‑detection echo
+                SendFrameWithFunc(src, MyNode, 0x46, tns, func, 0x00, data);
+            else if (cmd == 0x06 && func == 0x03)
+                SendGetStatusResponse(src, tns);
+            else if (cmd == 0x06 && func == 0x01)
+                // Read diagnostic counters. Reply CMD = 0x46 (CMD 0x06 | 0x40).
+                // (Not 0x4A, which is the reply for CMD 0x0A)
+                SendDiagnosticCountersResponse(src, tns, replyCmd: 0x46);
+            else if (cmd == 0x06 && func == 0x07)
+            {
+                // Reset diagnostic counters (Publication 1770-6.5.16, page 7-22).
+                // Resets all counters to zero. Reply CMD = 0x46, no data.
+                ResetDiagnosticCounters();
+                SendFrameWithoutFunc(src, MyNode, 0x46, tns, func, 0x00, Array.Empty<byte>());
+            }
+            else if (cmd == 0x06 && func == 0x02)
+            {
+                // Echo/loopback — RSLinx diagnostic; reflect data back unchanged
+                SendFrameWithFunc(src, MyNode, 0x46, tns, func, 0x00, data);
+            }
+            else if (cmd == 0x01)
+            {
+                // Reset — sent by RSLinx during auto-configure
+                SendFrameWithFunc(src, MyNode, 0x41, tns, 0x00, 0x00, Array.Empty<byte>());
+            }
+            else if (cmd == 0x0B)
+            {
+                // Set Variables — RSLinx pushes communication parameters.
+                // Acknowledge with success; no parameters are actually changed.
+                SendFrameWithoutFunc(src, MyNode, 0x4B, tns, 0x00, 0x00, Array.Empty<byte>());
+            }
+            else if (cmd == 0x0F)
+            {
+                switch (func)
+                {
+                    case 0xA1: // Protected Typed Logical Read (2-address fields)
+                    case 0xA2: // Protected Typed Logical Read (3-address fields, with sub-element)
+                        HandleReadRequest(src, tns, func, data);
+                        break;
+                    case 0xAA: // Protected Typed Logical Write (word)
+                    case 0xAB: // Protected Typed Logical Write (bit-masked)
+                        HandleWriteRequest(src, tns, func, data);
+                        break;
+                    case 0x94: // Read File Info — SLC 5/03 and 5/04 only
+                        HandleReadFileInfo(src, tns, data);
+                        break;
+                    case 0x80: // Change mode — SLC 500/5/03/5/04 (Publication 1770-6.5.16 page 7-5)
+                        // Mode codes per spec: 0x01=PROG (REM), 0x06=RUN (REM), 0x07=TEST continuous,
+                        // 0x08=TEST single scan, 0x09=TEST single step (SLC 5/03 supported)
+                        if (data != null && data.Length > 0)
+                        {
+                            byte requestedMode = data[0];
+                            _processorMode = requestedMode switch
+                            {
+                                0x01 => ProcessorMode.RemoteProg,
+                                0x06 => ProcessorMode.RemoteRun,
+                                0x07 => ProcessorMode.TestCont,
+                                0x08 => ProcessorMode.TestSingle,
+                                0x09 => ProcessorMode.TestStep,
+                                _    => _processorMode // unknown mode: ignore
+                            };
+                            UpdateProcessorMode();
+                            Console.WriteLine($"Mode changed to {_processorMode} (FNC=0x80, data=0x{requestedMode:X2})");
+                        }
+                        SendFrameWithoutFunc(src, MyNode, 0x4F, tns, func, 0x00, Array.Empty<byte>());
+                        break;
+                    case 0x3A: // Change mode — MicroLogix 1000 (data: 0x01=PROG, 0x02=RUN)
+                        if (data != null && data.Length > 0)
+                        {
+                            byte requestedMode = data[0];
+                            _processorMode = requestedMode switch
+                            {
+                                0x01 => ProcessorMode.RemoteProg,
+                                0x02 => ProcessorMode.RemoteRun,
+                                _    => _processorMode
+                            };
+                            UpdateProcessorMode();
+                            Console.WriteLine($"Mode changed to {_processorMode} (FNC=0x3A, data=0x{requestedMode:X2})");
+                        }
+                        SendFrameWithoutFunc(src, MyNode, 0x4F, tns, func, 0x00, Array.Empty<byte>());
+                        break;
+                    case 0x68: // Protected Typed Logical Read (three address fields) – AB Application Note, page 6
+                        HandleReadRequest(src, tns, func, data);
+                        break;
+                    case 0x29: // Unrecognised function code sent by RSLinx during auto-configure
+                        SendFrameWithoutFunc(src, MyNode, 0x4F, tns, func, 0x00, Array.Empty<byte>());
+                        break;
+                    default:
+                        SendErrorResponse(src, tns, cmd, func, 0x01);
+                        break;
+                }
+            }
+            else if (cmd == 0x0A)
+            {
+                // Diagnostic Counters request (DH+ style). Reply CMD = 0x4A.
+                SendDiagnosticCountersResponse(src, tns, replyCmd: 0x4A);
+            }
+            else if (cmd == 0x67)
+            {
+                // Read Modified Data (treated as normal read for simplicity)
+                HandleReadModifiedData(src, tns, data);
+            }
+            else
+                SendErrorResponse(src, tns, cmd, func, 0x01);
+        }
+        catch (Exception ex) { Console.WriteLine("ProcessFrame error: " + ex.Message); }
+    }
+
+    // ─── Command handlers ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Diagnostic Status response (CMD=0x06, FNC=0x03).
+    /// Response CMD = 0x46 (0x06 | 0x40), sent WITHOUT FUNC byte.
+    ///
+    /// Inner frame layout (WithoutFunc):
+    ///   [0]=DST [1]=SRC [2]=CMD [3]=STS [4]=TNS_LO [5]=TNS_HI [6]=DATA[0] ...
+    ///
+    /// DF1Comm reads ProcessorType from DataPackets[rTNS][9] = inner[9] = DATA[3].
+    /// payload[3] = 0x49 (SLC 5/03) → ProcessorType = 0x49.
+    ///
+    /// Payload layout per Publication 1770-6.5.16 Chapter 10 (1747-L532):
+    ///   Byte  0    : mode/status flags — bits 0-5 = 0, bit 6 = testing edits,
+    ///                bit 7 = edits in processor. NOT the mode code.
+    ///   Byte  1    : 0xEE — type extender
+    ///   Byte  2    : 0x34 — extended interface type (DF1 full-duplex, port 0)
+    ///   Byte  3    : 0x49 — extended processor type (1747-L534 rack, SLC 5/03)
+    ///   Byte  4    : series/revision
+    ///   Byte  5–15 : bulletin number "5/03" in ASCII, space-padded to 11 bytes
+    ///   Byte 16–17 : major error word (0x0000 = no fault)
+    ///   Byte 18    : processor mode status/control low byte — mode code bits 0-4
+    ///                  0x11 = local PROG   0x1E = local RUN
+    ///                  0x17 = TEST-cont    0x18 = TEST-single   0x19 = TEST-step
+    ///   Byte 19    : processor mode status/control high byte — fault flags
+    ///   Byte 20–21 : program ID
+    ///   Byte 22    : RAM size in Kbytes — 0x10 for 1747-L532E (16K)
+    ///   Byte 23    : flags (bits 2-7 = program owner node, 0x3F = no owner)
+    ///                bit 0 = directory file corrupted
+    /// </summary>
+    private void SendGetStatusResponse(int dst, int tns)
+    {
+        byte[] payload = new byte[24];
+
+        // Byte 0 = mode/status flags (not mode code). Bits 0-5 = 0, bit 6 = testing edits, bit 7 = edits in processor.
+        payload[0] = 0x00; // no edits active
+
+        payload[1] = 0xEE; // type extender — same for all SLC 5/03
+        payload[2] = 0x34; // extended interface type: DF1 full-duplex on port 0
+
+        // Byte 3: extended processor type. Per spec: 0x49 = rack type 1747-L534 (SLC 5/03 channel 0).
+        payload[3] = 0x49;
+
+        // Byte 4: series/revision (bits 0-4 = firmware release, bits 5-7 = series letter).
+        payload[4] = 0x22;
+
+        // Bulletin number in ASCII, space-padded to 11 bytes (bytes 5-15). Spec says "5/03" for 1747-L532.
+        string catalog = "5/03";
+        byte[] catBytes = System.Text.Encoding.ASCII.GetBytes(catalog);
+        Array.Copy(catBytes, 0, payload, 5, catBytes.Length);
+        for (int i = 5 + catBytes.Length; i < 16; i++) payload[i] = 0x20;
+
+        // Bytes 16-17: major error word. 0x0000 = no fault.
+        payload[16] = 0x00;
+        payload[17] = 0x00;
+
+        // Bytes 18-19 = processor mode status/control word.
+        // Low byte (byte 18): bits 0-4 = mode code, bit 5 = forces active,
+        //                     bit 6 = forces installed, bit 7 = communication active.
+        // High byte (byte 19): bit 0 = protection power loss, bit 1 = startup protect fault,
+        //                      bit 5 = major error/halted, bit 6 = locked, bit 7 = first pass.
+        payload[18] = (byte)_processorMode; // mode code from enum — matches spec values exactly
+        payload[19] = 0x00;                 // no fault flags
+
+        // Bytes 20-21: program ID (0 = no program loaded).
+        payload[20] = 0x00;
+        payload[21] = 0x00;
+
+        // Byte 22 = RAM size in Kbytes. 1747-L532E = 16K words = 32 KB.
+        payload[22] = 0x20;
+
+        // Byte 23 = flags. Bit 0 = directory file corrupted (0 = ok). Bits 2-7 = program owner node address (0x3F = none).
+        payload[23] = 0x3F;
+
+        SendFrameWithoutFunc(dst, MyNode, 0x46, tns, 0x03, 0x00, payload);
+    }
+
+    /// <summary>
+    /// Diagnostic Counters response.
+    /// - CMD 0x06 FNC 0x01 → replyCmd = 0x46
+    /// - CMD 0x0A           → replyCmd = 0x4A
+    ///
+    /// Layout per AB Application Note (March 1995), page 17,
+    /// "Reply for Data for DF1 Full-Duplex size <=40 bytes":
+    ///   Bytes  0-1  : RS-232 modem line status (CTS/RTS/DSR/DCD/DTR bits)
+    ///   Bytes  2-3  : total message packets sent
+    ///   Bytes  4-5  : total message packets received
+    ///   Bytes  6-7  : undelivered message packets
+    ///   Bytes  8-9  : ENQuiry packets sent
+    ///   Bytes 10-11 : NAK packets received
+    ///   Bytes 12-13 : ENQ packets received
+    ///   Bytes 14-15 : bad message packets received and NAK'd
+    ///   Bytes 16-17 : no buffer space and NAK'd
+    ///   Bytes 18-19 : duplicate message packets received
+    ///   Bytes 20-21 : 00h (unused — poll scan times are DH485/half-duplex only)
+    ///   Bytes 22-23 : DCD recover field
+    ///   Bytes 24-25 : lost modem field
+    ///   Bytes 26-33 : 00h (unused) × 8
+    ///
+    /// Total: 34 bytes (modem status word + 32 counter bytes).
+    /// </summary>
+    private void SendDiagnosticCountersResponse(int dst, int tns, int replyCmd)
+    {
+        UpdateModemStatus();
+
+        // Read all counters atomically via Interlocked.
+        int sent        = Interlocked.CompareExchange(ref _totalPacketsSent,         0, 0);
+        int received    = Interlocked.CompareExchange(ref _totalPacketsReceived,     0, 0);
+        int undelivered = Interlocked.CompareExchange(ref _undeliveredPackets,       0, 0);
+        int enqSent     = Interlocked.CompareExchange(ref _enqSent,                 0, 0);
+        int nakRecv     = Interlocked.CompareExchange(ref _nakReceived,              0, 0);
+        int enqRecv     = Interlocked.CompareExchange(ref _enqReceived,             0, 0);
+        int bad         = Interlocked.CompareExchange(ref _badPacketsDetected,       0, 0);
+        int noBuf       = Interlocked.CompareExchange(ref _noBufferNakd,            0, 0);
+        int dup         = Interlocked.CompareExchange(ref _duplicatePacketsReceived, 0, 0);
+        int dcd         = Interlocked.CompareExchange(ref _dcdRecoveryCount,        0, 0);
+        int lost        = Interlocked.CompareExchange(ref _lostModemCount,           0, 0);
+
+        // 34 bytes total for DF1 full-duplex
+        byte[] counters = new byte[34];
+
+        void W(int idx, int val)
+        {
+            counters[idx]     = (byte)(val & 0xFF);
+            counters[idx + 1] = (byte)((val >> 8) & 0xFF);
+        }
+
+        W(0,  _modemStatus); // Bytes 0-1:   RS-232 modem line status
+        W(2,  sent);          // Bytes 2-3:   total packets sent
+        W(4,  received);      // Bytes 4-5:   total packets received
+        W(6,  undelivered);   // Bytes 6-7:   undelivered packets
+        W(8,  enqSent);       // Bytes 8-9:   ENQ packets sent
+        W(10, nakRecv);       // Bytes 10-11: NAK packets received
+        W(12, enqRecv);       // Bytes 12-13: ENQ packets received
+        W(14, bad);           // Bytes 14-15: bad packets / NAK'd
+        W(16, noBuf);         // Bytes 16-17: no buffer space / NAK'd
+        W(18, dup);           // Bytes 18-19: duplicate packets received
+        // Bytes 20-21: 00h unused (DF1 has no poll scan time)
+        W(22, dcd);           // Bytes 22-23: DCD recovery count
+        W(24, lost);          // Bytes 24-25: lost modem count
+        // Bytes 26-33: 00h unused × 8
+
+        SendFrameWithoutFunc(dst, MyNode, replyCmd, tns, 0x00, 0x00, counters);
+    }
+
+    /// <summary>
+    /// Reset all diagnostic counters to zero (CMD=0x06, FNC=0x07).
+    /// Publication 1770-6.5.16, page 7-22.
+    /// </summary>
+    private void ResetDiagnosticCounters()
+    {
+        Interlocked.Exchange(ref _totalPacketsSent,         0);
+        Interlocked.Exchange(ref _totalPacketsReceived,     0);
+        Interlocked.Exchange(ref _undeliveredPackets,       0);
+        Interlocked.Exchange(ref _enqSent,                  0);
+        Interlocked.Exchange(ref _nakReceived,               0);
+        Interlocked.Exchange(ref _enqReceived,              0);
+        Interlocked.Exchange(ref _badPacketsDetected,       0);
+        Interlocked.Exchange(ref _noBufferNakd,             0);
+        Interlocked.Exchange(ref _duplicatePacketsReceived, 0);
+        Interlocked.Exchange(ref _dcdRecoveryCount,         0);
+        Interlocked.Exchange(ref _lostModemCount,           0);
+        Console.WriteLine("Diagnostic counters reset.");
+    }
+
+    /// <summary>
+    /// Read Modified Data (CMD=0x67) – simplified as normal read.
+    /// </summary>
+    private void HandleReadModifiedData(int dst, int tns, byte[] payload)
+    {
+        if (payload == null || payload.Length < 5)
+        {
+            SendErrorResponse(dst, tns, 0x67, 0x00, 0x01);
+            return;
+        }
+        int fileNumber   = payload[0];
+        int fileType     = payload[1];
+        int offsetWords  = payload[2] | (payload[3] << 8);
+        int bytesToRead  = payload[4];
+        int byteOffset   = offsetWords * 2;
+
+        int fileSize = _memory.GetFileSize(fileType, fileNumber);
+        if (byteOffset + bytesToRead > fileSize)
+        {
+            SendErrorResponse(dst, tns, 0x67, 0x00, 0x10);
+            return;
+        }
+
+        byte[] data = _memory.ReadRaw(fileType, fileNumber, byteOffset, bytesToRead, out int status);
+        if (status != 0)
+        {
+            SendErrorResponse(dst, tns, 0x67, 0x00, 0x10);
+            return;
+        }
+        SendFrameWithoutFunc(dst, MyNode, 0xA7, tns, 0x00, 0x00, data);
+    }
+
+    /// <summary>
+    /// Read File Info (CMD=0x0F, FNC=0x94).
+    /// SLC 5/03 and SLC 5/04 only. Used by RSLinx to enumerate data files.
+    ///
+    /// Command format (AB Application Note, March 1995, section 6.5):
+    ///   FNC = 0x94
+    ///   mask = 0x06  (2 bytes follow: major file type + file number)
+    ///   major file type = 0x80 (data table file)
+    ///   file number = 0x00–0xFF
+    ///
+    /// Reply data (9 bytes on success):
+    ///   Bytes 0-3 : file size in bytes (32-bit little-endian)
+    ///   Bytes 4-5 : element count (16-bit little-endian)
+    ///   Byte  6   : element count high byte (reserved — repeat of byte 5 per doc)
+    ///   Byte  7   : reserved (0x00)
+    ///   Byte  8   : data type byte (0x84=status, 0x85=bit, 0x86=timer, etc.)
+    ///
+    /// Error codes:
+    ///   STS=0x00            success
+    ///   STS=0x10            illegal format (wrong mask or major file type)
+    ///   STS=0x50            bad address / file doesn't exist
+    ///   STS=0xF0 EXT=0x1B   file protection error + owner node address byte
+    /// </summary>
+    private void HandleReadFileInfo(int dst, int tns, byte[] payload)
+    {
+        // Minimum: mask(1) + majorType(1) + fileNumber(1) = 3 bytes
+        if (payload == null || payload.Length < 3)
+        {
+            SendErrorResponse(dst, tns, 0x0F, 0x94, 0x10);
+            return;
+        }
+
+        byte mask         = payload[0];
+        byte majorType    = payload[1];
+        byte fileNumber   = payload[2];
+
+        // Validate: mask must be 0x06, major type must be 0x80 (data table)
+        if (mask != 0x06 || majorType != 0x80)
+        {
+            SendErrorResponse(dst, tns, 0x0F, 0x94, 0x10);
+            return;
+        }
+
+        Console.WriteLine($"    ReadFileInfo fileNumber={fileNumber}");
+
+        // Ask PlcMemory for the file type code and size for this file number.
+        if (!_memory.GetFileInfo(fileNumber, out int fileType, out int fileSize, out int elements))
+        {
+            // File number not found / not initialised
+            SendErrorResponse(dst, tns, 0x0F, 0x94, 0x50);
+            return;
+        }
+
+        byte[] reply = new byte[9];
+        // Bytes 0-3: file size in bytes (32-bit little-endian)
+        reply[0] = (byte)(fileSize & 0xFF);
+        reply[1] = (byte)((fileSize >> 8) & 0xFF);
+        reply[2] = (byte)((fileSize >> 16) & 0xFF);
+        reply[3] = (byte)((fileSize >> 24) & 0xFF);
+        // Bytes 4-5: element count
+        reply[4] = (byte)(elements & 0xFF);
+        reply[5] = (byte)((elements >> 8) & 0xFF);
+        // Byte 6: reserved (high byte of count per doc)
+        reply[6] = reply[5]; // repeat of byte 5 per AB Application Note
+        // Byte 7: reserved
+        reply[7] = 0x00;
+        // Byte 8: data type code
+        reply[8] = (byte)fileType;
+
+        SendFrameWithoutFunc(dst, MyNode, 0x4F, tns, 0x94, 0x00, reply);
+    }
+
+    
+    /// Response CMD = 0x4F, WITHOUT FUNC byte.
+    /// DF1Comm reads returned data starting at DataPackets[rTNS][6] = inner[6] = DATA[0].
+    ///
+    /// Request payload layout (from DF1Comm ReadRawData):
+    ///   [0]    = bytesToRead
+    ///   [1]    = fileNumber
+    ///   [2]    = fileType
+    ///   [3]    = element  (255 = extended: element in [4..5], then subElement follows)
+    ///            OR element (0–254) directly
+    ///   [4]    = subElement (func 0xA2 only; or element low byte if [3]==255)
+    ///   [5]    = element high byte (if [3]==255)
+    ///
+    /// Supports extended element addressing (element >= 255) by decoding 0xFF followed by two bytes.
+    /// </summary>
+    private void HandleReadRequest(int dst, int tns, int func, byte[] payload)
+    {
+        if (payload == null || payload.Length < 4)
+        {
+            SendErrorResponse(dst, tns, 0x0F, func, 0x01);
+            return;
+        }
+
+        int bytesToRead = payload[0];
+        int fileNumber  = payload[1];
+        int fileType    = payload[2];
+
+        // Decode element with extended addressing support
+        int element     = payload[3];
+        int payloadIdx  = 4;
+        if (element == 0xFF && payload.Length > payloadIdx + 1)
+        {
+            element = payload[payloadIdx] | (payload[payloadIdx + 1] << 8);
+            payloadIdx += 2;
+        }
+
+        // Decode subElement (0xA2 only)
+        int subElement = 0;
+        if (func == 0xA2 && payload.Length > payloadIdx)
+        {
+            if (payload[payloadIdx] == 0xFF && payload.Length > payloadIdx + 2)
+            {
+                subElement = payload[payloadIdx + 1] | (payload[payloadIdx + 2] << 8);
+            }
+            else
+            {
+                subElement = payload[payloadIdx];
+            }
+        }
+
+        int bpe        = _memory.GetBytesPerElement(fileType, fileNumber);
+        int byteOffset = element * bpe + subElement * 2;
+
+        string extNote = (payload[3] == 0xFF) ? " (ext)" : "";
+        Console.WriteLine($"    Read func=0x{func:X2} fileType=0x{fileType:X2} file={fileNumber} elem={element}{extNote} sub={subElement} bytes={bytesToRead}");
+
+        byte[] data = _memory.ReadRaw(fileType, fileNumber, byteOffset, bytesToRead, out int status);
+        if (status == 2) { SendErrorResponse(dst, tns, 0x0F, func, 0x50); return; } // file not found
+        if (status == 3) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; } // out of range / too large
+        if (status != 0) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; }
+
+        SendFrameWithoutFunc(dst, MyNode, 0x4F, tns, func, 0x00, data);
+    }
+
+    /// <summary>
+    /// Handle Protected Typed Logical Write (0xAA) and Bit Write (0xAB).
+    /// Response CMD = 0x4F with empty data on success, WITHOUT FUNC byte.
+    ///
+    /// Request payload layout (from DF1Comm WriteRawData):
+    ///
+    ///   func 0xAA — word write:
+    ///     [0] = bytesToWrite
+    ///     [1] = fileNumber
+    ///     [2] = fileType
+    ///     [3] = element  (255 = extended: [4..5] = element 16-bit, then subElement)
+    ///     [4] = subElement (or element low byte if [3]==255)
+    ///     [5..] = data bytes (word write) or mask + value (bit write)
+    ///
+    ///   func 0xAB — bit-masked write:
+    ///     [0] = 2  (one word operation)
+    ///     [1] = fileNumber
+    ///     [2] = fileType
+    ///     [3] = element  (255 = extended)
+    ///     [4] = subElement (or element low byte if [3]==255)
+    ///     [5] = mask low byte
+    ///     [6] = mask high byte
+    ///     [7] = value low byte   (bits to set where mask bit = 1)
+    ///     [8] = value high byte
+    ///
+    /// Supports extended element addressing (element >= 255).
+    /// For I/O image file types (0x8B output-by-slot, 0x8C input-by-slot), the mask is ignored
+    /// and data is written directly (SLCCCD section 4.36).
+    /// </summary>
+    private void HandleWriteRequest(int dst, int tns, int func, byte[] payload)
+    {
+        if (payload == null || payload.Length < 5)
+        {
+            SendErrorResponse(dst, tns, 0x0F, func, 0x01);
+            return;
+        }
+
+        int bytesToWrite = payload[0];
+        int fileNumber   = payload[1];
+        int fileType     = payload[2];
+
+        // Decode element with extended addressing support
+        int element    = payload[3];
+        int payloadIdx = 4;
+        if (element == 0xFF && payload.Length > payloadIdx + 1)
+        {
+            element = payload[payloadIdx] | (payload[payloadIdx + 1] << 8);
+            payloadIdx += 2;
+        }
+
+        if (payload.Length <= payloadIdx)
+        {
+            SendErrorResponse(dst, tns, 0x0F, func, 0x01);
+            return;
+        }
+
+        // Decode subElement with extended addressing support
+        int subElement = payload[payloadIdx];
+        payloadIdx++;
+        if (subElement == 0xFF && payload.Length > payloadIdx + 1)
+        {
+            subElement = payload[payloadIdx] | (payload[payloadIdx + 1] << 8);
+            payloadIdx += 2;
+        }
+
+        string extNote = (payload[3] == 0xFF) ? " (ext)" : "";
+        Console.WriteLine($"    Write func=0x{func:X2} fileType=0x{fileType:X2} file={fileNumber} elem={element}{extNote} sub={subElement} bytes={bytesToWrite}");
+
+        if (func == 0xAB)
+        {
+            // Bit-masked write requires mask (2 bytes) and value (2 bytes) after header
+            if (payload.Length < payloadIdx + 4)
+            {
+                SendErrorResponse(dst, tns, 0x0F, func, 0x01);
+                return;
+            }
+
+            int mask  = payload[payloadIdx]     | (payload[payloadIdx + 1] << 8);
+            int value = payload[payloadIdx + 2] | (payload[payloadIdx + 3] << 8);
+
+            int bpe        = _memory.GetBytesPerElement(fileType, fileNumber);
+            int byteOffset = element * bpe + subElement * 2;
+
+            // For I/O image file types (0x8B output-by-slot, 0x8C input-by-slot), mask is ignored (direct write)
+            bool isIoFile = fileType == 0x8B || fileType == 0x8C;
+            if (isIoFile)
+            {
+                // Direct write — no read-modify-write, no mask applied
+                byte[] directData = { (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF) };
+                bool okDirect = _memory.Write(fileType, fileNumber, element, subElement, 2, directData);
+                if (!okDirect) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; }
+            }
+            else
+            {
+                // Standard read-modify-write: only the bits set in mask are affected
+                byte[] current = _memory.ReadRaw(fileType, fileNumber, byteOffset, 2, out int readStatus);
+                if (readStatus != 0) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; }
+
+                int word = current[0] | (current[1] << 8);
+                word = (word & ~mask) | (value & mask);
+                byte[] newData = { (byte)(word & 0xFF), (byte)(word >> 8) };
+
+                bool ok = _memory.Write(fileType, fileNumber, element, subElement, 2, newData);
+                if (!ok) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; }
+            }
+        }
+        else
+        {
+            // Word write (0xAA): data bytes follow immediately after the address header
+            if (payload.Length < payloadIdx + bytesToWrite)
+            {
+                SendErrorResponse(dst, tns, 0x0F, func, 0x01);
+                return;
+            }
+
+            byte[] writeData = new byte[bytesToWrite];
+            Array.Copy(payload, payloadIdx, writeData, 0, bytesToWrite);
+            bool ok = _memory.Write(fileType, fileNumber, element, subElement, bytesToWrite, writeData);
+            if (!ok) { SendErrorResponse(dst, tns, 0x0F, func, 0x10); return; }
+        }
+
+        SendFrameWithoutFunc(dst, MyNode, 0x4F, tns, func, 0x00, Array.Empty<byte>());
+    }
+
+    // ─── Frame builders ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Send a DF1 response frame WITH FUNC byte.
+    /// Inner payload: DST SRC CMD STS TNS_LO TNS_HI FUNC [DATA...]
+    /// Used for echo (CMD 0x06/0x02), Reset (CMD 0x01), and error responses.
+    /// </summary>
+    private void SendFrameWithFunc(int dstNode, int srcNode, int cmd, int tns,
+                                   int func, byte status, byte[] data)
+    {
+        var inner = new List<byte>
+        {
+            (byte)dstNode, (byte)srcNode,
+            (byte)cmd, status,
+            (byte)(tns & 0xFF), (byte)((tns >> 8) & 0xFF),
+            (byte)func
+        };
+        if (data != null && data.Length > 0) inner.AddRange(data);
+        SendRawFrame(inner.ToArray(), cmd, func, status, tns);
+    }
+
+    /// <summary>
+    /// Send a DF1 response frame WITHOUT FUNC byte.
+    /// Inner payload: DST SRC CMD STS TNS_LO TNS_HI [DATA...]
+    /// Used for Get Status, Read, Write, mode-change, and Set Variables responses.
+    /// DF1Comm reads returned data starting at DataPackets[rTNS][6] = inner[6] = DATA[0].
+    /// </summary>
+    private void SendFrameWithoutFunc(int dstNode, int srcNode, int cmd, int tns,
+                                      int func, byte status, byte[] data)
+    {
+        var inner = new List<byte>
+        {
+            (byte)dstNode, (byte)srcNode,
+            (byte)cmd, status,
+            (byte)(tns & 0xFF), (byte)((tns >> 8) & 0xFF)
+        };
+        if (data != null && data.Length > 0) inner.AddRange(data);
+        SendRawFrame(inner.ToArray(), cmd, func, status, tns);
+    }
+
+    /// <summary>
+    /// Build and transmit the final serial frame:
+    ///   DLE STX | DLE-stuffed(inner) | DLE ETX | checksum
+    /// Checksum is computed over innerArray only; CalculateChecksum appends ETX internally.
+    /// </summary>
+    private void SendRawFrame(byte[] innerArray, int cmd, int func, byte status, int tns)
+    {
+        Interlocked.Increment(ref _totalPacketsSent);
+
+        ushort chk     = MessageDecoder.CalculateChecksum(innerArray, CheckSum);
+        byte[] stuffed = MessageDecoder.ApplyDleStuffing(innerArray);
+
+        var frame = new List<byte> { 0x10, 0x02 };
+        frame.AddRange(stuffed);
+        frame.Add(0x10); frame.Add(0x03);
+        frame.Add((byte)(chk & 0xFF));
+        if (CheckSum == CheckSumOptions.Crc)
+            frame.Add((byte)((chk >> 8) & 0xFF));
+
+        try
+        {
+            lock (_txLock)
+            {
+                _port.Write(frame.ToArray(), 0, frame.Count);
+            }
+
+            LogDelta($"cmd=0x{cmd:X2} tns={tns} func=0x{func:X2} sts=0x{status:X2} → \n    TX: ");
+            foreach (byte b in frame) Console.Write($"{b:X2} ");
+            Console.WriteLine();
+        }
+        catch (Exception ex) { Console.WriteLine("Write error: " + ex.Message); }
+    }
+
+    private void SendAck()
+    {
+        try
+        {
+            lock (_txLock)
+            {
+                _port.Write(new byte[] { 0x10, 0x06 }, 0, 2);
+                LogDelta("type=ACK → \n    TX: 10 06\n");
+            }
+        }
+        catch { }
+    }
+
+    private void SendNak()
+    {
+        try
+        {
+            lock (_txLock)
+            {
+                _port.Write(new byte[] { 0x10, 0x15 }, 0, 2);
+                LogDelta("type=NAK → \n    TX: 10 15\n");
+            }
+        }
+        catch { }
+    }
+
+    // Error response always includes FUNC byte so the client can identify which
+    // command failed (cmd | 0x40 sets the reply bit; non-zero STS signals the error).
+    private void SendErrorResponse(int dst, int tns, int cmd, int func, byte status)
+        => SendFrameWithFunc(dst, MyNode, cmd | 0x40, tns, func, status, Array.Empty<byte>());
+
+    private void UpdateModemStatus()
+    {
+        if (!_port.IsOpen) return;
+        ushort status = 0;
+        if (_port.CtsHolding) status |= 0x0001;
+        if (_port.RtsEnable)  status |= 0x0002;
+        if (_port.DsrHolding) status |= 0x0004;
+        if (_port.CDHolding)  status |= 0x0008;
+        if (_port.DtrEnable)  status |= 0x0010;
+        _modemStatus = status;
+    }
+
+    // Instance field + _logLock prevents race between DataReceived thread and the UpdateDateTime timer thread.
+    private void LogDelta(string msg)
+    {
+        lock (_logLock)
+        {
+            var now = DateTime.Now;
+            var dt  = (now - _lastLog).TotalMilliseconds;
+            _lastLog = now;
+            Console.Write($"{now:HH:mm:ss.fff} (+{dt:0000} ms) {msg}");
+        }
+    }
+}
