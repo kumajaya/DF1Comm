@@ -27,7 +27,7 @@ namespace DF1Comm
         private int ProcessorType;
         private int SleepDelay;          // backoff delay, managed by DataLink but also used locally
 
-        private readonly int[] Responded = new int[256]; // 0=false, 1=true
+        private readonly int[] Responded = new int[65536]; // 0=false, 1=true; indexed by full 16-bit TNS
         // ConcurrentDictionary used instead of Collection<byte>[] to allow thread-safe
         // atomic reference assignment between the receive thread pool callback and the
         // calling thread reading packet data after WaitForResponse.
@@ -120,12 +120,40 @@ namespace DF1Comm
                 throw new DF1Exception("Failed to change to Run mode, Check PLC Key switch - " + MessageDecoder.DecodeMessage(reply));
         }
 
+        /// <summary>
+        /// Changes the operating mode of a PLC-5 or MicroLogix processor
+        /// at the next I/O scan (CMD=0x0F, FNC=0x3A). Processor must be in Remote mode.
+        /// Mode values per AB spec:
+        ///   0x00 = Program, 0x01 = Remote Test, 0x02 = Remote Run
+        /// For SLC 500/5/03/5/04, use SetRunMode/SetProgramMode instead (FNC=0x80).
+        /// For MicroLogix 1000, use FNC=0x3A with 0x01=PROG, 0x02=RUN.
+        /// Compatibility: MicroLogix 1000, PLC-5, PLC-5/250.
+        /// Returns 0 on success, non-zero error code on failure.
+        /// </summary>
+        public int SetCPUMode(byte modeValue)
+        {
+            byte[] data = { modeValue };
+            int reply = PrefixAndSend(0x0F, 0x3A, data, true, out _);
+            return reply;
+        }
+
         public int GetRunMode()
         {
             int result = PrefixAndSend(0x06, 0x01, new byte[0], true, out int rTNS);
             if (result == 0 && DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 6)
                 return pkt[6];
             return -1;
+        }
+
+        /// <summary>
+        /// Disables all I/O forces in the processor (CMD=0x0F, FNC=0x41).
+        /// Compatibility: SLC 500, SLC 5/03, SLC 5/04, PLC-5.
+        /// Returns 0 on success, non-zero error code on failure.
+        /// </summary>
+        public int DisableForces()
+        {
+            int reply = PrefixAndSend(0x0F, 0x41, Array.Empty<byte>(), true, out _);
+            return reply;
         }
 
         public void SetProgramMode()
@@ -259,6 +287,37 @@ namespace DF1Comm
             int[] ints = new int[result.Length];
             for (int i = 0; i < result.Length; i++) ints[i] = Convert.ToInt32(result[i]);
             return ints;
+        }
+
+        /// <summary>
+        /// Sets or resets specified bits in one or more data table words (CMD=0x0F, FNC=0x26).
+        /// Each set specifies an address, an AND mask, and an OR mask.
+        /// The PLC processes each set as: word = (word AND andMask) OR orMask.
+        /// A '0' bit in andMask resets that bit; a '1' in orMask sets that bit.
+        /// Compatibility: PLC-5, PLC-5/VME (ref libpccc pccc_cmd_ReadModifyWrite).
+        /// Maximum total encoded size of all sets must not exceed 243 bytes.
+        /// Returns 0 on success, non-zero error code on failure.
+        /// </summary>
+        public int ReadModifyWrite(string[] addresses, ushort[] andMasks, ushort[] orMasks)
+        {
+            if (addresses == null || addresses.Length == 0)
+                throw new DF1Exception("ReadModifyWrite: number of sets must be non-zero.");
+            if (andMasks == null || orMasks == null)
+                throw new DF1Exception("ReadModifyWrite: andMasks and orMasks cannot be null.");
+            if (addresses.Length != andMasks.Length || addresses.Length != orMasks.Length)
+                throw new DF1Exception("ReadModifyWrite: addresses, andMasks, and orMasks must have the same length.");
+
+            DataAddress[] parsed = new DataAddress[addresses.Length];
+            for (int i = 0; i < addresses.Length; i++)
+            {
+                parsed[i] = AddressParser.Parse(addresses[i]);
+                if (parsed[i].FileType == 0)
+                    throw new DF1Exception($"ReadModifyWrite: invalid address '{addresses[i]}'.");
+            }
+
+            byte[] body = PacketBuilder.BuildReadModifyWriteBody(parsed, andMasks, orMasks);
+            int reply = PrefixAndSend(0x0F, 0x26, body, true, out _);
+            return reply;
         }
 
         // ─── Write ────────────────────────────────────────────────────────────────
@@ -740,7 +799,7 @@ namespace DF1Comm
         {
             IncrementTNS();
             byte[] pkt = PacketBuilder.BuildCommandWithData(command, func, data, TNS, MyNode, TargetNode, Protocol == "DF1");
-            rTNS = TNS & 0xFF;
+            rTNS = TNS; // full 16-bit TNS — no truncation
             Interlocked.Exchange(ref Responded[rTNS], 0);
 
             int result;
@@ -945,17 +1004,17 @@ namespace DF1Comm
                     return; // not for us, ignore
             }
 
-            // Determine TNS
+            // Determine TNS — read both low and high bytes for full 16-bit value.
             int xTNS = 0;
             if (Protocol == "DF1")
             {
-                if (pdu.Length > 4 && pdu[2] > 31)
-                    xTNS = pdu[4];
+                if (pdu.Length > 5 && pdu[2] > 31)
+                    xTNS = pdu[4] | (pdu[5] << 8);
             }
             else
             {
-                if (pdu.Length > 8)
-                    xTNS = pdu[8];
+                if (pdu.Length > 9)
+                    xTNS = pdu[8] | (pdu[9] << 8);
             }
 
             // Atomically replace the packet reference. Reading threads snapshot the reference

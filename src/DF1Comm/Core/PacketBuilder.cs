@@ -224,4 +224,62 @@ public static class PacketBuilder
         byte[] body = BuildWriteRequestBody(addr, dataToWrite, writeOffset, bytesToWrite, out int func);
         return BuildCommandWithData(0x0F, func, body, tns, myNode, targetNode, true);
     }
+
+    /// <summary>
+    /// Builds the body for a Read Modify Write command (CMD=0x0F, FNC=0x26).
+    /// Each set contains: encoded address + AND mask (2 bytes LE) + OR mask (2 bytes LE).
+    /// The PLC processes each set as: word = (word AND andMask) OR orMask.
+    /// Maximum total data size is 243 bytes per AB spec (libpccc cmd_init_0f.c line 731).
+    /// Compatibility: PLC-5, PLC-5/VME.
+    /// </summary>
+    public static byte[] BuildReadModifyWriteBody(DataAddress[] addresses,
+                                                ushort[] andMasks,
+                                                ushort[] orMasks)
+    {
+        if (addresses.Length == 0)
+            throw new ArgumentException("Number of sets must be non-zero.");
+        if (addresses.Length != andMasks.Length || addresses.Length != orMasks.Length)
+            throw new ArgumentException("addresses, andMasks, and orMasks must have the same length.");
+
+        var body = new List<byte>();
+        for (int i = 0; i < addresses.Length; i++)
+        {
+            // Encode address: FileNumber, FileType, Element, SubElement
+            // Uses same encoding as BuildReadRequestBody (SLC logical address format)
+            body.Add((byte)addresses[i].FileNumber);
+            body.Add((byte)addresses[i].FileType);
+
+            if (addresses[i].Element < 255)
+                body.Add((byte)addresses[i].Element);
+            else
+            {
+                body.Add(0xFF);
+                body.Add((byte)(addresses[i].Element & 0xFF));
+                body.Add((byte)((addresses[i].Element >> 8) & 0xFF));
+            }
+
+            if (addresses[i].SubElement < 255)
+                body.Add((byte)addresses[i].SubElement);
+            else
+            {
+                body.Add(0xFF);
+                body.Add((byte)(addresses[i].SubElement & 0xFF));
+                body.Add((byte)((addresses[i].SubElement >> 8) & 0xFF));
+            }
+
+            // AND mask (little-endian)
+            body.Add((byte)(andMasks[i] & 0xFF));
+            body.Add((byte)((andMasks[i] >> 8) & 0xFF));
+
+            // OR mask (little-endian)
+            body.Add((byte)(orMasks[i] & 0xFF));
+            body.Add((byte)((orMasks[i] >> 8) & 0xFF));
+
+            // Per AB spec and libpccc: total data must not exceed 243 bytes
+            if (body.Count > 243)
+                throw new DF1Exception($"ReadModifyWrite: set {i + 1} exceeded maximum command size of 243 bytes.");
+        }
+
+        return body.ToArray();
+    }
 }

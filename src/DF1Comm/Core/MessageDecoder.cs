@@ -136,7 +136,19 @@ public static class MessageDecoder
             case -20: return "No Data Returned";
             case -21: return "Received Message NAKd from invalid checksum";
 
-            // Standard STS codes from PLC
+            // Local STS error codes (link layer problems, not remote node).
+            // Source: libpccc sts.c; AB Publication 1770-6.5.16 Chapter 8.
+            case 1:  return "Destination node is out of buffer space";
+            case 2:  return "Cannot guarantee delivery, link layer";
+            case 3:  return "Duplicate token holder detected";
+            case 4:  return "Local port is disconnected";
+            case 5:  return "Application layer timed out waiting for response";
+            case 6:  return "Duplicate node detected";
+            case 7:  return "Station is offline";
+            case 8:  return "Hardware fault";
+
+            // Remote STS error codes (returned by the target node).
+            // Values are the raw STS byte value (upper nibble × 16).
             case 16:  return "Illegal Command or Format, Address may not exist or not enough elements in data file";
             case 32:  return "PLC Has a Problem and Will Not Communicate";
             case 48:  return "Remote Node Host is Missing, Disconnected, or Shut Down";
@@ -146,9 +158,14 @@ public static class MessageDecoder
             case 112: return "Processor is in Program mode";
             case 128: return "Compatibility mode file missing or communication zone problem";
             case 144: return "Remote node cannot buffer command";
+            case 160: return "Wait ACK";
+            case 176: return "Remote node problem due to download";
+            case 192: return "Wait ACK";
             case 240: return "Error code in EXT STS Byte";
 
-            // EXT STS codes (256 added to code to distinguish)
+            // EXT STS codes for CMD 0x0F (DH/DH+).
+            // 256 is added to the raw EXT STS byte to distinguish from standard STS.
+            // Source: libpccc sts.c ext_sts_dh(); AB Publication 1770-6.5.16 Appendix B.
             case 257: return "A field has an illegal value";
             case 258: return "Less levels specified in address than minimum for any address";
             case 259: return "More levels specified in address than system supports";
@@ -163,6 +180,24 @@ public static class MessageDecoder
             case 268: return "Condition cannot be generated - resource is not available";
             case 269: return "Condition already exists - resource is already available";
             case 270: return "Command cannot be executed";
+            case 271: return "Histogram overflow";
+            case 272: return "No access";
+            case 273: return "Illegal data type";
+            case 274: return "Invalid parameter or invalid data";
+            case 275: return "Address reference exists to deleted area";
+            case 276: return "Command execution failure for unknown reason";
+            case 277: return "Data conversion error";
+            case 278: return "Scanner not able to communicate with 1771 rack adapter";
+            case 279: return "Type mismatch";
+            case 280: return "1771 module response was not valid";
+            case 281: return "Duplicate label";
+            case 282: return "File is open; another node owns it";
+            case 283: return "Another node is the program owner";
+            case 286: return "Data table element protection violation";
+            case 287: return "Temporary internal problem";
+            case 290: return "Remote rack fault";
+            case 291: return "Timeout";
+            case 292: return "Unknown error";
 
             default: return "Unknown Message - " + msgNumber;
         }
