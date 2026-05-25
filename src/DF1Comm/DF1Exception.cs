@@ -5,6 +5,8 @@ namespace DF1Comm;
 /// </summary>
 public class DF1Exception : Exception
 {
+    public DF1Exception() { }
+
     public DF1Exception(string message) : base(message) { }
 
     public DF1Exception(string message, Exception inner) : base(message, inner) { }

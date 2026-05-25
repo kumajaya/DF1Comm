@@ -109,7 +109,7 @@ public static class PacketBuilder
 
     /// <summary>
     /// Builds the body for a write command (0xAA word write / 0xAB bit write).
-    /// Buffer allocation = (dataSize) + 1 extra byte (compatible with original).
+    /// Buffer allocation is dynamic based on extended addressing requirements.
     /// </summary>
     public static byte[] BuildWriteRequestBody(DataAddress addr, byte[] dataToWrite,
                                                 int writeOffset, int bytesToWrite, out int function)
@@ -118,13 +118,20 @@ public static class PacketBuilder
         if (addr.BitNumber >= 0 && addr.BitNumber < 16)
         {
             function = 0xAB;
-            byte[] body = new byte[8 + 1]; // original: 8 bytes + 1 extra
+
+            // Calculate dynamic size: base 8 bytes + extended addressing overhead
+            int bodySize = 8;
+            if (addr.Element >= 255) bodySize += 2;
+            if (addr.SubElement >= 255) bodySize += 2;
+
+            byte[] body = new byte[bodySize + 1]; // +1 for original VB compatibility
             int idx = 0;
+
             body[idx++] = (byte)bytesToWrite;
             body[idx++] = (byte)addr.FileNumber;
             body[idx++] = (byte)addr.FileType;
 
-            // Element
+            // Element field (with extended addressing if needed)
             if (addr.Element < 255)
                 body[idx++] = (byte)addr.Element;
             else
@@ -134,7 +141,7 @@ public static class PacketBuilder
                 body[idx++] = (byte)((addr.Element >> 8) & 0xFF);
             }
 
-            // Sub-element
+            // Sub-element field (with extended addressing if needed)
             if (addr.SubElement < 255)
                 body[idx++] = (byte)addr.SubElement;
             else
@@ -144,11 +151,12 @@ public static class PacketBuilder
                 body[idx++] = (byte)((addr.SubElement >> 8) & 0xFF);
             }
 
+            // Bit mask
             int bitMask = 1 << addr.BitNumber;
             body[idx++] = (byte)(bitMask & 0xFF);
             body[idx++] = (byte)((bitMask >> 8) & 0xFF);
 
-            // Value
+            // Value (set or clear)
             if (writeOffset < dataToWrite.Length && dataToWrite[writeOffset] != 0)
             {
                 body[idx++] = (byte)(bitMask & 0xFF);
@@ -159,25 +167,27 @@ public static class PacketBuilder
                 body[idx++] = 0;
                 body[idx++] = 0;
             }
+
             return body;
         }
         else
         {
             // Word write (0xAA)
             function = 0xAA;
-            // Calculate base size: 5 (size,file,type,element,subelement) + bytesToWrite
-            int dataSize = 5 + bytesToWrite;
-            if (addr.Element >= 255) dataSize += 2;
-            if (addr.SubElement >= 255) dataSize += 2;
 
-            byte[] body = new byte[dataSize + 1]; // +1 extra
+            // Calculate base size: 5 (size,file,type,element,subelement) + bytesToWrite
+            int bodySize = 5 + bytesToWrite;
+            if (addr.Element >= 255) bodySize += 2;
+            if (addr.SubElement >= 255) bodySize += 2;
+
+            byte[] body = new byte[bodySize + 1]; // +1 for original VB compatibility
             int idx = 0;
 
             body[idx++] = (byte)bytesToWrite;
             body[idx++] = (byte)addr.FileNumber;
             body[idx++] = (byte)addr.FileType;
 
-            // Element
+            // Element field
             if (addr.Element < 255)
                 body[idx++] = (byte)addr.Element;
             else
@@ -187,7 +197,7 @@ public static class PacketBuilder
                 body[idx++] = (byte)((addr.Element >> 8) & 0xFF);
             }
 
-            // Sub-element
+            // Sub-element field
             if (addr.SubElement < 255)
                 body[idx++] = (byte)addr.SubElement;
             else
@@ -200,6 +210,7 @@ public static class PacketBuilder
             // Data
             int copyLen = Math.Min(bytesToWrite, dataToWrite.Length - writeOffset);
             Array.Copy(dataToWrite, writeOffset, body, idx, copyLen);
+
             return body;
         }
     }

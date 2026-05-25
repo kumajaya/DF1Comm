@@ -78,42 +78,6 @@ public static class MessageDecoder
         }
     }
 
-    // ─── DLE Stuffing ─────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Apply DLE stuffing: every 0x10 in payload becomes 0x10 0x10.
-    /// </summary>
-    public static byte[] ApplyDleStuffing(byte[] payload)
-    {
-        var list = new List<byte>(payload.Length * 2);
-        foreach (byte b in payload)
-        {
-            list.Add(b);
-            if (b == 0x10) list.Add(0x10);
-        }
-        return list.ToArray();
-    }
-
-    /// <summary>
-    /// Remove DLE stuffing: 0x10 0x10 → single 0x10.
-    /// </summary>
-    public static byte[] RemoveDleStuffing(byte[] stuffed)
-    {
-        var list = new List<byte>(stuffed.Length);
-        for (int i = 0; i < stuffed.Length; i++)
-        {
-            byte b = stuffed[i];
-            if (b == 0x10 && i + 1 < stuffed.Length && stuffed[i + 1] == 0x10)
-            {
-                list.Add(0x10);
-                i++;
-            }
-            else
-                list.Add(b);
-        }
-        return list.ToArray();
-    }
-
     // ─── DecodeMessage ────────────────────────────────────────────────────────
 
     /// <summary>

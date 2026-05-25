@@ -16,7 +16,7 @@ public class DataLink : IDisposable
     private const byte ENQ = 0x05;
 
     // ─── Fields ───────────────────────────────────────────────────────────────
-    private readonly SerialPortWrapper _port;
+    private readonly ISerialPort _port;
     private readonly object _rxLock = new object();
     private readonly List<byte> _rxBuffer = new List<byte>();
     private DateTime _frameStartTime = DateTime.MinValue;
@@ -25,7 +25,7 @@ public class DataLink : IDisposable
 
     private CheckSumOptions _checksumType = CheckSumOptions.Crc;
     private int _sleepDelay = 0;          // backoff delay (ms) after NAK
-    private bool _lastResponseWasNAK = false;
+    private volatile bool _lastResponseWasNAK = false;
 
     // For ACK/NAK polling in SendFrame
     private bool _ackReceived;
@@ -81,7 +81,7 @@ public class DataLink : IDisposable
     public bool IsPortOpen => _port.IsOpen;
 
     // ─── Constructor ──────────────────────────────────────────────────────────
-    public DataLink(SerialPortWrapper port)
+    public DataLink(ISerialPort port)
     {
         _port = port ?? throw new ArgumentNullException(nameof(port));
         _port.BytesReceived += OnBytesReceived;
@@ -235,6 +235,9 @@ public class DataLink : IDisposable
     {
         if (chunk == null || chunk.Length == 0) return;
 
+        byte[]? pduToDeliver = null;
+        bool enqReceived = false;
+
         lock (_rxLock)
         {
             _rxBuffer.AddRange(chunk);
@@ -271,27 +274,11 @@ public class DataLink : IDisposable
                     {
                         // Set ACK flag (with timer if SleepDelay > 0)
                         if (_sleepDelay > 0)
+                            System.Threading.Thread.Sleep(_sleepDelay);
+                        lock (_ackLock)
                         {
-                            var timer = new System.Timers.Timer(_sleepDelay);
-                            timer.AutoReset = false;
-                            timer.Elapsed += (s, e) =>
-                            {
-                                lock (_ackLock)
-                                {
-                                    _ackReceived = true;
-                                    _ackFlagForEnq = true;
-                                }
-                                timer.Dispose();
-                            };
-                            timer.Start();
-                        }
-                        else
-                        {
-                            lock (_ackLock)
-                            {
-                                _ackReceived = true;
-                                _ackFlagForEnq = true;
-                            }
+                            _ackReceived = true;
+                            _ackFlagForEnq = true;
                         }
                     }
                     else if (ctrl == NAK)
@@ -305,8 +292,7 @@ public class DataLink : IDisposable
                     }
                     else if (ctrl == ENQ)
                     {
-                        // Raise event so DF1Comm can reply
-                        EnqReceived?.Invoke(this, EventArgs.Empty);
+                        enqReceived = true; // defer invocation
                     }
                     consumed = true;
                     continue;
@@ -384,8 +370,7 @@ public class DataLink : IDisposable
                     {
                         SendControl(ACK);
                         _lastResponseWasNAK = false;
-                        // Raise event for upper layer
-                        PacketReceived?.Invoke(this, pdu);
+                        pduToDeliver = pdu; // defer invocation
                     }
                     else
                     {
@@ -402,6 +387,12 @@ public class DataLink : IDisposable
                 consumed = true;
             }
         }
+
+        // Invoke events outside the lock
+        if (enqReceived)
+            EnqReceived?.Invoke(this, EventArgs.Empty);
+        if (pduToDeliver != null)
+            PacketReceived?.Invoke(this, pduToDeliver);
     }
 
     // ─── IDisposable ─────────────────────────────────────────────────────────

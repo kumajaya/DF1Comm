@@ -25,9 +25,11 @@ namespace DF1Comm
         private readonly Random rnd = new Random();
         private ushort TNS;
         private int ProcessorType;
-        private int SleepDelay;          // backoff delay, managed by DataLink but also used locally
 
-        private readonly int[] Responded = new int[65536]; // 0=false, 1=true; indexed by full 16-bit TNS
+        private readonly ManualResetEventSlim[] ResponseEvents =
+            Enumerable.Range(0, 65536)
+                    .Select(_ => new ManualResetEventSlim(false))
+                    .ToArray();
         // ConcurrentDictionary used instead of Collection<byte>[] to allow thread-safe
         // atomic reference assignment between the receive thread pool callback and the
         // calling thread reading packet data after WaitForResponse.
@@ -39,7 +41,7 @@ namespace DF1Comm
         private bool PacketOpened;
 
         // Flag to suppress DataReceived events during bulk transfers (upload/download/autodetect)
-        private bool DisableEvent;
+        private volatile bool DisableEvent;
 
         // Data link layer reference
         private readonly DataLink dataLink;
@@ -80,10 +82,20 @@ namespace DF1Comm
 
         // ─── Events ──────────────────────────────────────────────────────────────
         public event EventHandler? DataReceived;
-        public event EventHandler? UnsolictedMessageRcvd;
+        public event EventHandler? UnsolicitedMessageRcvd;
         public event EventHandler? AutoDetectTry;
         public event EventHandler? DownloadProgress;
         public event EventHandler? UploadProgress;
+
+        private int responseTimeoutMs = 2000;
+        /// <summary>
+        /// Gets or sets the response timeout in milliseconds. Default is 2000 ms.
+        /// </summary>
+        public int ResponseTimeoutMs
+        {
+            get => responseTimeoutMs;
+            set => responseTimeoutMs = value > 0 ? value : 2000;
+        }
 
         // ─── Constructor ─────────────────────────────────────────────────────────
         public DF1Comm(string? portName = null, int baud = 19200,
@@ -101,8 +113,23 @@ namespace DF1Comm
             dataLink.ChecksumType = CheckSum;
             dataLink.PacketReceived += DataLink_PacketReceived;
             dataLink.EnqReceived += DataLink_EnqReceived;
-            // Keep SleepDelay in sync with DataLink
-            SleepDelay = dataLink.SleepDelay;
+        }
+
+        /// <summary>
+        /// Constructor for dependency injection (unit testing or custom serial implementations).
+        /// </summary>
+        /// <param name="dataLink">Pre-configured DataLink instance (e.g., with mock serial port).</param>
+        /// <remarks>
+        /// When using this constructor, the properties ComPort, BaudRate, and Parity are not used.
+        /// Changing them after construction will have no effect on the communication.
+        /// </remarks>
+        public DF1Comm(DataLink dataLink)
+        {
+            TNS = (ushort)((rnd.Next() & 0x7F) + 1);
+            this.dataLink = dataLink ?? throw new ArgumentNullException(nameof(dataLink));
+            this.dataLink.ChecksumType = CheckSum;
+            this.dataLink.PacketReceived += DataLink_PacketReceived;
+            this.dataLink.EnqReceived += DataLink_EnqReceived;
         }
 
         // =========================================================================
@@ -170,14 +197,17 @@ namespace DF1Comm
         public int GetProcessorType()
         {
             byte[] data = Array.Empty<byte>();
-            if (PrefixAndSend(6, 3, data, true, out int rTNS) == 0)
+            int reply = PrefixAndSend(6, 3, data, true, out int rTNS);
+            if (reply != 0)
+                throw new DF1Exception("GetProcessorType failed: " + MessageDecoder.DecodeMessage(reply));
+
+            if (DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 9)
             {
-                if (DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 9)
-                    ProcessorType = pkt[9];
-                else
-                    throw new DF1Exception("GetProcessorType: response packet too short");
+                ProcessorType = pkt[9];
+                return ProcessorType;
             }
-            return ProcessorType;
+
+            throw new DF1Exception("GetProcessorType: response packet too short or missing");
         }
 
         // ─── Read ─────────────────────────────────────────────────────────────────
@@ -207,15 +237,20 @@ namespace DF1Comm
                 numberOfBytes = (numberOfBytes * 3) - 4;
 
             int reply = 0;
-            byte[] returnedData = new byte[numberOfBytes + 1];
-            int returnedDataIndex = 0, retries = 0;
+            byte[] returnedData = Array.Empty<byte>();
+            int retries = 0;
 
-            while (reply == 0 && returnedDataIndex < numberOfBytes)
+            while (retries <= 2)
             {
-                byte[] chunk = ReadRawData(p, numberOfBytes, out reply);
-                if (reply == 0) { chunk.CopyTo(returnedData, returnedDataIndex); returnedDataIndex += numberOfBytes; }
-                else if (retries < 2) { retries++; reply = 0; }
-                else throw new DF1Exception(MessageDecoder.DecodeMessage(reply));
+                returnedData = ReadRawData(p, numberOfBytes, out reply);
+                if (reply == 0)
+                    break;
+                if (retries < 2)
+                {
+                    retries++;
+                    continue;
+                }
+                throw new DF1Exception(MessageDecoder.DecodeMessage(reply));
             }
 
             string[] result = new string[arrayElements + 1];
@@ -382,28 +417,31 @@ namespace DF1Comm
 
         public int WriteData(string startAddress, string dataToWrite)
         {
-            if (string.IsNullOrEmpty(dataToWrite)) return 0; // changed: null check alone is not sufficient
+            if (string.IsNullOrEmpty(dataToWrite)) return 0;
+
+            // Limit to 82 characters (max for ST file)
+            if (dataToWrite.Length > 82) dataToWrite = dataToWrite[..82];
+
             DataAddress p = AddressParser.Parse(startAddress);
 
-            // Limit string length to 82 characters (max AB ST file)
-            if (dataToWrite.Length > 82) dataToWrite = dataToWrite.Substring(0, 82);
+            // Convert to words using existing StringConverter
+            int[]? words = StringConverter.StringToWords(dataToWrite);
+            if (words == null) return -1;
 
-            dataToWrite += "\0";
-            // Alocation: 2 byte header (length word) + string length (padded to even)
-            int byteCount = ((dataToWrite.Length + 1) / 2) * 2 + 2;
-            byte[] converted = new byte[byteCount];
+            // Buffer: 2 bytes for length + 2 bytes per word
+            byte[] converted = new byte[words.Length * 2 + 2];
 
-            converted[0] = (byte)(dataToWrite.Length - 1);
-            int i = 2;
-            while (i < dataToWrite.Length + 1) // < not <=, prevent overrun
+            // Length field (number of characters, not bytes)
+            converted[0] = (byte)dataToWrite.Length;
+
+            // Write each word in little-endian byte order (low byte first)
+            for (int i = 0; i < words.Length; i++)
             {
-                if (i - 1 < dataToWrite.Length)
-                    converted[i] = Encoding.ASCII.GetBytes(dataToWrite.Substring(i - 1, 1))[0];
-                if (i - 2 < dataToWrite.Length)
-                    converted[i + 1] = Encoding.ASCII.GetBytes(dataToWrite.Substring(i - 2, 1))[0];
-                i += 2;
+                converted[i * 2 + 2] = (byte)((words[i] >> 8) & 0xFF); // high byte = first character
+                converted[i * 2 + 3] = (byte)(words[i] & 0xFF);        // low  byte = second character
             }
-            return WriteRawData(p, dataToWrite.Length + 1, converted);
+
+            return WriteRawData(p, dataToWrite.Length + 2, converted);
         }
 
         // ─── Data Memory ─────────────────────────────────────────────────────────
@@ -534,9 +572,9 @@ namespace DF1Comm
                 else
                 {
                     if (data.Length < 6) Array.Resize(ref data, 6);
-                    data[5] = (byte)(subElement / 256);
-                    data[4] = (byte)(subElement - data[5] * 256);
                     data[3] = 255;
+                    data[4] = (byte)(subElement & 0xFF);
+                    data[5] = (byte)((subElement >> 8) & 0xFF);
                 }
                 data[0] = (byte)(fzSize - filePosition < 80 ? fzSize - filePosition : 80);
             }
@@ -793,14 +831,23 @@ namespace DF1Comm
         // PRIVATE METHODS (identical to original but using builder and dataLink)
         // =========================================================================
 
-        private void IncrementTNS() => TNS = TNS < 65535 ? (ushort)(TNS + 1) : (ushort)1;
+        private readonly object tnsLock = new object();
+
+        private ushort IncrementAndGetTNS()
+        {
+            lock (tnsLock)
+            {
+                TNS = TNS < 65535 ? (ushort)(TNS + 1) : (ushort)1;
+                return TNS;
+            }
+        }
 
         private int PrefixAndSend(int command, int func, byte[] data, bool wait, out int rTNS)
         {
-            IncrementTNS();
-            byte[] pkt = PacketBuilder.BuildCommandWithData(command, func, data, TNS, MyNode, TargetNode, Protocol == "DF1");
-            rTNS = TNS; // full 16-bit TNS — no truncation
-            Interlocked.Exchange(ref Responded[rTNS], 0);
+            ushort currentTNS = IncrementAndGetTNS();
+            byte[] pkt = PacketBuilder.BuildCommandWithData(command, func, data, currentTNS, MyNode, TargetNode, Protocol == "DF1");
+            rTNS = currentTNS; // full 16-bit TNS — no truncation
+            ResponseEvents[rTNS].Reset(); // clear event
 
             int result;
             if (Protocol == "DF1")
@@ -845,8 +892,6 @@ namespace DF1Comm
         {
             // Use DataLink to send the PDU (without DLE stuffing etc.)
             int result = dataLink.SendFrame(pdu, waitForAck: true);
-            // Update local SleepDelay from DataLink (for backoff)
-            SleepDelay = dataLink.SleepDelay;
             return result;
         }
 
@@ -858,16 +903,12 @@ namespace DF1Comm
 
         private int WaitForResponse(int rTNS)
         {
-            int loops = 0;
-            const int maxLoops = 100;
-            while (Interlocked.CompareExchange(ref Responded[rTNS], 0, 0) == 0 && loops < maxLoops)
+            if (ResponseEvents[rTNS].Wait(responseTimeoutMs))
             {
-                Thread.Sleep(20);
-                loops++;
+                if (dataLink.LastResponseWasNAK) return -21;
+                return 0;
             }
-            if (loops >= maxLoops) return -20;
-            if (dataLink.LastResponseWasNAK) return -21;
-            return 0;
+            return -20; // timeout
         }
 
         private int SendENQ()
@@ -1008,6 +1049,9 @@ namespace DF1Comm
             int xTNS = 0;
             if (Protocol == "DF1")
             {
+                // Only extract TNS for replies (CMD > 31) because commands (CMD <= 31) 
+                // are unsolicited messages that don't need TNS matching.
+                // Replies always have CMD = original CMD + 0x40, so they are > 31.
                 if (pdu.Length > 5 && pdu[2] > 31)
                     xTNS = pdu[4] | (pdu[5] << 8);
             }
@@ -1021,8 +1065,8 @@ namespace DF1Comm
             // via TryGetValue, so they are never exposed to a partially-written collection.
             DataPackets[xTNS] = pdu;
 
-            // Signal waiting thread (original used Responded array)
-            Interlocked.Exchange(ref Responded[xTNS], 1);
+            // Signal waiting thread
+            ResponseEvents[xTNS]?.Set();
 
             // Handle unsolicited messages and DH485 (exactly as original)
             if (Protocol == "DF1")
@@ -1037,7 +1081,7 @@ namespace DF1Comm
                 {
                     int tns = pdu[5] * 256 + pdu[4];
                     SendResponse(pdu[2] + 0x40, tns);
-                    UnsolictedMessageRcvd?.Invoke(this, EventArgs.Empty); // never suppressed
+                    UnsolicitedMessageRcvd?.Invoke(this, EventArgs.Empty); // never suppressed
                 }
             }
             else
@@ -1045,15 +1089,15 @@ namespace DF1Comm
                 // DH485 logic (identical to original, with DisableEvent check for DataReceived)
                 if (pdu.Length > 1 && pdu[1] == 0x18)
                 {
-                    IncrementTNS();
-                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                    ushort currentTNS = IncrementAndGetTNS();
+                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), currentTNS, MyNode, TargetNode, false);
                     dataLink.SendFrame(resp, waitForAck: false);
                     PacketOpened = true; CommandInQueue = false;
                 }
                 if (pdu.Length > 1 && pdu[1] > 0 && pdu[1] != 0x18)
                 {
-                    IncrementTNS();
-                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0x18, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                    ushort currentTNS = IncrementAndGetTNS();
+                    byte[] resp = PacketBuilder.BuildCommandWithData(0, 0x18, Array.Empty<byte>(), currentTNS, MyNode, TargetNode, false);
                     dataLink.SendFrame(resp, waitForAck: false);
                     PacketOpened = true;
                     if (pdu.Length > 1 && pdu[1] > 1 && (pdu[1] & 31) == 0x08)
@@ -1067,7 +1111,8 @@ namespace DF1Comm
                 {
                     if (!CommandInQueue || PacketOpened)
                     {
-                        byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), TNS, MyNode, TargetNode, false);
+                        ushort currentTNS = IncrementAndGetTNS();
+                        byte[] resp = PacketBuilder.BuildCommandWithData(0, 0, Array.Empty<byte>(), currentTNS, MyNode, TargetNode, false);
                         dataLink.SendFrame(resp, waitForAck: false);
                         PacketOpened = false;
                     }

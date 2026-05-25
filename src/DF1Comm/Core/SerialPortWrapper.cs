@@ -5,7 +5,7 @@ namespace DF1Comm.Core;
 /// <summary>
 /// Serial port wrapper with robust byte array handling and deadlock prevention.
 /// </summary>
-public class SerialPortWrapper : IDisposable
+public class SerialPortWrapper : ISerialPort
 {
     private readonly SerialPort _port;
     private readonly object _sync = new object();
