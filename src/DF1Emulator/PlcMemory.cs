@@ -23,7 +23,7 @@ using System.Collections.Generic;
 /// Data table file numbers:
 ///   0 = O0  (Output,  type 0x8B, 2 elems, 6 words  = 12 bytes) ← real PLC: Elems=2, Words=6
 ///   1 = I1  (Input,   type 0x8C, 7 elems, 21 words = 42 bytes) ← real PLC: Elems=7, Words=21
-///   2 = S2  (Status,  type 0x84, 83 words  = 166 bytes, S:0–S:82)
+///   2 = S2  (Status,  type 0x84, 84 words  = 168 bytes, S:0–S:83)
 ///   3 = B3  (Binary,  type 0x85, 14 words  = 28 bytes)
 ///   4 = T4  (Timer,   type 0x86, 78 elem   = 468 bytes, 6 bytes/elem)
 ///   5 = C5  (Counter, type 0x87, 1 elem    = 6 bytes)
@@ -52,7 +52,7 @@ public class PlcMemory
     private readonly object _lock = new object();
     
     // Fast lookup: file number → file type code (0 if not a data file)
-    private readonly int[] _fileTypeByNumber = new int[32];
+    private readonly Dictionary<int, int> _fileTypeByNumber = new();
 
     public PlcMemory()
     {
@@ -102,7 +102,7 @@ public class PlcMemory
         // Write all data files first, in order of file number.
         Reg(file0, pos, 0x8B, 12, 0, 2); pos += 10;  // O0 — 2 elems, 6 words = 12 bytes
         Reg(file0, pos, 0x8C, 42, 1, 2); pos += 10;  // I1 — 7 elems, 21 words = 42 bytes
-        Reg(file0, pos, 0x84, 166, 2, 2); pos += 10; // S2
+        Reg(file0, pos, 0x84, 168, 2, 2); pos += 10; // S2
         Reg(file0, pos, 0x85, 28, 3, 2); pos += 10;  // B3
         Reg(file0, pos, 0x86, 468, 4, 6); pos += 10; // T4
         Reg(file0, pos, 0x87, 6, 5, 6); pos += 10;   // C5
@@ -202,19 +202,19 @@ public class PlcMemory
         _files[(0x8C, 1)] = new byte[42];
         _bytesPerElement[(0x8C, 1)] = 2;
 
-        // ── S2 — Status (file 2, 83 words = S:0–S:82) ────────────────────────
+        // ── S2 — Status (file 2, 84 words = S:0–S:83) ────────────────────────
         // Values initialised from the supplied hex dump (little-endian words).
-        _files[(0x84, 2)] = new byte[166];
+        _files[(0x84, 2)] = new byte[168];
         _bytesPerElement[(0x84, 2)] = 2;
 
         ushort[] s2vals = new ushort[]
         {
             // S2:0 .. S2:9
-            0x0004, 0x0481, 0x9012, 0xA003, 0x69C4, 0x0000, 0x0000, 0x0000, 0x0000, 0x0003,
+            0x0004, 0x001E, 0x9012, 0xA003, 0x69C4, 0x0000, 0x0000, 0x0000, 0x0000, 0x0003,
             // S2:10 .. S2:19
             0x0000, 0x0000, 0x0000, 0x0000, 0x001E, 0x0401, 0x0016, 0x0002, 0x0000, 0x0000,
             // S2:20 .. S2:29
-            0x0000, 0x0000, 0x0031, 0x000C, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0031, 0x000C, 0x0020, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
             // S2:30 .. S2:39
             0x0000, 0x0000, 0x0018, 0x0000, 0x007D, 0x0000, 0x07EA, 0x0005, 0x0015, 0x0000,
             // S2:40 .. S2:49
@@ -225,8 +225,8 @@ public class PlcMemory
             0x0214, 0x0004, 0x0008, 0x0001, 0x005F, 0x0010, 0x01E0, 0x0006, 0x0000, 0x0000,
             // S2:70 .. S2:79
             0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-            // S2:80 .. S2:82
-            0x0000, 0x0000, 0x0000
+            // S2:80 .. S2:83
+            0x0000, 0x0000, 0x0000, 0x0000
         };
         for (int i = 0; i < s2vals.Length; i++)
             WriteU16(_files[(0x84, 2)], i * 2, s2vals[i]);
@@ -276,7 +276,7 @@ public class PlcMemory
         CreateDataFile(0x85, 30, 52, 2);  // B30
         CreateDataFile(0x85, 31, 52, 2);  // B31
 
-        // ── I/O Configuration file (file type 0x60, file number 0) ──────────────────
+// ── I/O Configuration file (file type 0x60, file number 0) ──────────────────
         // Source: AB Publication 1747-UM011, S:96 area; accessed via CMD=0x0F FNC=0xA2.
         // DF1Comm.GetSlotCount reads 4 bytes at element=0; byte [0] is the raw chassis
         // slot count. GetSlotCount() returns (raw - 1).
@@ -297,26 +297,28 @@ public class PlcMemory
         // Minimum buffer = 4 + 8*6 + 2 = 54 bytes; padded to 64.
         CreateDataFile(0x60, 0, 64, 2);
         byte[] ioConfig = _files[(0x60, 0)];
-        ioConfig[0] = 8;                        // raw slot count (DF1Comm subtracts 1)
+        ioConfig[0] = 8;                            // raw slot count (DF1Comm subtracts 1)
+
+        // Slot base offset = i * 6 + 4; +0 = InputBytes, +2 = OutputBytes
 
         // Slot 1 — 1746-IB16, 16-ch digital input
-        ioConfig[1 * 6 + 4] = 2;               // InputBytes = 2
+        ioConfig[1 * 6 + 4 + 0] = 2;               // InputBytes = 2
 
         // Slot 2 — 1746-IB16, 16-ch digital input
-        ioConfig[2 * 6 + 4] = 2;               // InputBytes = 2
+        ioConfig[2 * 6 + 4 + 0] = 2;               // InputBytes = 2
 
         // Slot 3 — 1746-IB16, 16-ch digital input
-        ioConfig[3 * 6 + 4] = 2;               // InputBytes = 2
+        ioConfig[3 * 6 + 4 + 0] = 2;               // InputBytes = 2
 
         // Slot 4 — 1746-OB16, 16-ch digital output
-        ioConfig[4 * 6 + 6] = 2;               // OutputBytes = 2
+        ioConfig[4 * 6 + 4 + 2] = 2;               // OutputBytes = 2
 
         // Slot 5 — 1746-OB16, 16-ch digital output
-        ioConfig[5 * 6 + 6] = 2;               // OutputBytes = 2
+        ioConfig[5 * 6 + 4 + 2] = 2;               // OutputBytes = 2
 
         // Slot 6 — 1746-NI4, 4-ch analog input (4 × 16-bit words) + 1 control word
-        ioConfig[6 * 6 + 4] = 8;               // InputBytes  = 8 (4 channels × 2 bytes)
-        ioConfig[6 * 6 + 6] = 2;               // OutputBytes = 2 (control word)
+        ioConfig[6 * 6 + 4 + 0] = 8;               // InputBytes  = 8 (4 channels × 2 bytes)
+        ioConfig[6 * 6 + 4 + 2] = 2;               // OutputBytes = 2 (control word)
 
         // CardCode fields left as 0x0000 for all slots (not required for emulation)
 
@@ -326,7 +328,7 @@ public class PlcMemory
         // and copies them verbatim into the FNC=0x88 init packet (data[8..11]).
         // FNC=0x88/0x11/0x52/0x12 are not implemented; this file exists only to let
         // the read succeed before the emulator rejects 0x88 with an error response.
-        CreateDataFile(0x63, 0, 4, 4);          // content = 0x00000000 (sufficient)
+        CreateDataFile(0x63, 0, 4, 4);              // content = 0x00000000 (sufficient)
     }
 
     // ─── Public API ──────────────────────────────────────────────────────────
@@ -405,10 +407,16 @@ public class PlcMemory
     {
         lock (_lock)
         {
-            if (fileNumber >= 0 && fileNumber < _fileTypeByNumber.Length)
-                return _fileTypeByNumber[fileNumber];
-            return 0;
+            return _fileTypeByNumber.TryGetValue(fileNumber, out var type) ? type : 0;
         }
+    }
+
+    /// <summary>
+    /// GetFileInfo private helper
+    /// </summary>
+    private int GetFileTypeForNumberNoLock(int fileNumber)
+    {
+        return _fileTypeByNumber.TryGetValue(fileNumber, out var type) ? type : 0;
     }
 
     /// <summary>
@@ -424,7 +432,7 @@ public class PlcMemory
 
         lock (_lock)
         {
-            fileType = GetFileTypeForNumber(fileNumber);
+            fileType = GetFileTypeForNumberNoLock(fileNumber);
             if (fileType == 0) return false;
 
             byte[]? data = Lookup(fileType, fileNumber);

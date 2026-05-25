@@ -5,7 +5,7 @@ Lightweight, standalone DF1 RS-232 emulator that mimics an SLC 5/03 PLC for test
 
 ## Features
 - DF1 full‑duplex framing with DLE STX / DLE ETX and DLE stuffing
-- BCC (XOR) **default** – CRC‑16 (Modbus polynomial 0xA001) also supported
+- CRC‑16 (calculation as per AB specification) **default** – BCC (XOR) also supported
 - Get Status response crafted for SLC 5/03 (processor code `0x49`)
 - Reads from File 0 (directory) and any data file listed in the directory
 - In‑memory PLC file store with pre‑defined files (O, I, S, B, N, F, T, C, R)
@@ -25,15 +25,15 @@ dotnet build -c Release DF1Emulator.csproj
 
 ## Run
 
-**Default** (COM2, 19200, no parity, node 1, BCC checksum):
+**Default** (COM2, 19200, no parity, node 1, CRC checksum):
 ```bash
 dotnet run --project DF1Emulator.csproj -- COM2
 ```
 
 **Examples:**
 ```bash
-# Use CRC checksum, node 2
-dotnet run --project DF1Emulator.csproj -- COM2 --checksum crc --node 2
+# Use BCC checksum, node 2
+dotnet run --project DF1Emulator.csproj -- COM2 --checksum bcc --node 2
 
 # Change baud rate and parity
 dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
@@ -62,7 +62,7 @@ dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
 - Create an **RS-232 DF1** driver in RSLinx.
 - Point it to the COM port paired with the emulator.
 - Use **19200 baud, No parity, 8 data bits, 1 stop bit** (or match the emulator settings).
-- If RSLinx does not show the processor or memory, check the emulator console for hex logs and ensure `SPlcMemory` file offsets match RSLinx expectations.
+- If RSLinx does not show the processor or memory, check the emulator console for hex logs and ensure `PlcMemory` file offsets match RSLinx expectations.
 
 ## Project structure
 | File | Description |
@@ -70,12 +70,11 @@ dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
 | `Program.cs` | CLI entry point, argument parsing, usage help |
 | `DF1Emulator.cs` | Core DF1 frame parsing, command handlers, ACK/NAK, serial I/O |
 | `MessageDecoder.cs` | DLE stuffing/unstuffing, BCC/CRC checksum calculation |
-| `SPlcMemory.cs` | In‑memory file directory (File 0) and data files (O0, I1, S2, B3, N7, F8, T4, C5, R6, etc.) |
-| `CheckSumOptions.cs` | Enum for BCC/CRC selection |
+| `PlcMemory.cs` | In‑memory file directory (File 0) and data files (O0, I1, S2, B3, N7, F8, T4, C5, R6, etc.) |
 
 ## Extending the emulator
 - **Add new DF1 commands** – extend the dispatch logic in `DF1Emulator.ProcessFrame()`.
-- **Add new data files** – modify `SPlcMemory` constructor and the file directory inside `File 0`.
+- **Add new data files** – modify `PlcMemory` constructor and the file directory inside `File 0`.
 - **Change element sizes** – update `_bytesPerElement` dictionary and file size arrays.
 - **Simulate timers/counters** – implement background thread that updates T4 and C5 structures.
 
@@ -83,8 +82,8 @@ dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
 | Issue | Likely solution |
 |-------|------------------|
 | **Port busy / access denied** | Ensure no other application (including RSLinx) is using the same COM port. Use a virtual pair so emulator and client use different ends. |
-| **Checksum mismatch** | Verify the client and emulator use the same checksum type (`--checksum crc` or `bcc`). Emulator defaults to **BCC**. |
-| **RSLinx cannot see memory** | Enable verbose logging in emulator. Confirm that `Read File 0` requests are received and that the emulator responds with a valid directory. Check file offsets in `SPlcMemory`. |
+| **Checksum mismatch** | Verify the client and emulator use the same checksum type (`--checksum crc` or `bcc`). Emulator defaults to **CRC**. |
+| **RSLinx cannot see memory** | Enable verbose logging in emulator. Confirm that `Read File 0` requests are received and that the emulator responds with a valid directory. Check file offsets in `PlcMemory`. |
 | **No response after ENQ** | Make sure the emulator is running on the correct COM port and the baud rate/parity matches the client. The emulator automatically replies with ACK to ENQ. |
 
 ## License

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO.Ports;
 using System.Linq;
 using System.Threading;
+using System.Runtime.InteropServices;
 
 /// <summary>
 /// DF1 Full-Duplex SLC 5/03 emulator, compatible with both RSLinx auto-browse
@@ -45,7 +46,7 @@ using System.Threading;
 ///   - GetStatus byte 0 (mode/status flags) uses bits 6-7 only (edits active);
 ///     mode code is placed in bytes 18-19 as per Chapter 10 table.
 ///   - GetStatus catalog string is "5/03" per specification.
-///   - GetStatus RAM size is 0x10 (16K words for 1747-L532E).
+///   - GetStatus RAM size is 0x20 (16K words = 32 KB for 1747-L532E).
 ///   - GetStatus byte 24 added: directory corrupted flag + program owner.
 ///   - CMD 0x06 FNC 0x01 (read diagnostic counters) reply CMD is 0x46
 ///     (not 0x4A, which is the reply for CMD 0x0A).
@@ -74,11 +75,13 @@ public class DF1Emulator : IDisposable
 {
     private readonly SerialPort _port;
     private readonly List<byte> _rx = new List<byte>();
+
+    // Lock ordering: always acquire _rxLock before _txLock to avoid deadlock.
     private readonly object _rxLock = new object();
     private readonly object _txLock = new object();
     private readonly PlcMemory _memory;
 
-    public CheckSumOptions CheckSum { get; set; } = CheckSumOptions.Bcc;
+    public CheckSumOptions CheckSum { get; set; } = CheckSumOptions.Crc;
     public int MyNode { get; set; } = 1;
 
     // Full processor mode tracking per Publication 1770-6.5.16 Chapter 10.
@@ -96,7 +99,12 @@ public class DF1Emulator : IDisposable
         TestSingle  = 0x18,
         TestStep    = 0x19,
     }
-    private ProcessorMode _processorMode = ProcessorMode.LocalRun;
+    private volatile int _processorModeRaw = (int)ProcessorMode.LocalRun;
+    private ProcessorMode _processorMode
+    {
+        get => (ProcessorMode)_processorModeRaw;
+        set => _processorModeRaw = (int)value;
+    }
     private bool IsRunMode => _processorMode == ProcessorMode.LocalRun ||
                               _processorMode == ProcessorMode.RemoteRun;
 
@@ -204,9 +212,27 @@ public class DF1Emulator : IDisposable
     /// </summary>
     public void Start()
     {
-        if (!SerialPort.GetPortNames().Contains(_port.PortName, StringComparer.OrdinalIgnoreCase))
+        // Enumeration for Windows only
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            throw new InvalidOperationException($"Port '{_port.PortName}' not found. Available ports: {string.Join(", ", SerialPort.GetPortNames())}");
+            if (!System.IO.Ports.SerialPort.GetPortNames()
+                    .Contains(_port.PortName, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Port '{_port.PortName}' not found. Available ports: " +
+                    $"{string.Join(", ", System.IO.Ports.SerialPort.GetPortNames())}");
+            }
+        }
+        else
+        {
+            // Linux: cek /dev/ttyS* dan /dev/ttyUSB*
+            var ports = System.IO.Directory.GetFiles("/dev", "tty*");
+            if (!ports.Contains($"/dev/{_port.PortName}") &&
+                !ports.Contains(_port.PortName))
+            {
+                throw new InvalidOperationException(
+                    $"Port '{_port.PortName}' not found.");
+            }
         }
         
         try
@@ -237,17 +263,21 @@ public class DF1Emulator : IDisposable
     public void Stop()
     {
         _isDisposing = true;
-        
-        // Stop the timer so no further callbacks occur
+
+        // Stop timers so they don't start new work
         _timer?.Change(Timeout.Infinite, Timeout.Infinite);
         _waveformTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-        
-        // Unsubscribe event handler to prevent new callbacks
+
+        // Unsubscribe to prevent new callbacks from being raised
         _port.DataReceived -= Port_DataReceived;
-        
-        // Allow any in-flight DataReceived event to finish
-        Thread.Sleep(50);
-        
+
+        // Wait for any already-running DataReceived callback to complete
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (Interlocked.CompareExchange(ref _activeCallbacks, 0, 0) > 0 && sw.ElapsedMilliseconds < 500)
+        {
+            Thread.Sleep(10);
+        }
+
         try
         {
             if (_port.IsOpen)
@@ -269,11 +299,12 @@ public class DF1Emulator : IDisposable
     }
 
     // ─── Serial receive (no offload – must respond quickly to ACK/NAK) ───────
+    private int _activeCallbacks = 0;
+
     private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
     {
-        // Ignore any data if we are shutting down
         if (_isDisposing) return;
-        
+        Interlocked.Increment(ref _activeCallbacks);
         try
         {
             int toRead = _port.BytesToRead;
@@ -296,6 +327,10 @@ public class DF1Emulator : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"Port_DataReceived error: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeCallbacks);
         }
     }
 
@@ -414,8 +449,7 @@ public class DF1Emulator : IDisposable
             byte[] data = (unstuffed.Length > 7) ? unstuffed.Skip(7).ToArray() : Array.Empty<byte>();
 
             LogDelta($"\n    RX: ");
-            foreach (byte b in rawFrame) Console.Write($"{b:X2} ");
-            Console.WriteLine();
+            Console.WriteLine(string.Join(" ", rawFrame.Select(b => $"{b:X2}")));
             Console.WriteLine($"    dst={dst} src={src} cmd=0x{cmd:X2} tns={tns} func=0x{func:X2} dataLen={data.Length}");
 
             if (dst != MyNode && dst != 0xFF) return;
@@ -559,7 +593,7 @@ public class DF1Emulator : IDisposable
     ///                  0x17 = TEST-cont    0x18 = TEST-single   0x19 = TEST-step
     ///   Byte 19    : processor mode status/control high byte — fault flags
     ///   Byte 20–21 : program ID
-    ///   Byte 22    : RAM size in Kbytes — 0x10 for 1747-L532E (16K)
+    ///   Byte 22    : RAM size in Kbytes — 0x10 for 1747-L532E (32K)
     ///   Byte 23    : flags (bits 2-7 = program owner node, 0x3F = no owner)
     ///                bit 0 = directory file corrupted
     /// </summary>
@@ -1054,11 +1088,9 @@ public class DF1Emulator : IDisposable
             lock (_txLock)
             {
                 _port.Write(frame.ToArray(), 0, frame.Count);
+                LogDelta($"cmd=0x{cmd:X2} tns={tns} func=0x{func:X2} sts=0x{status:X2} → \n    TX: ");
+                Console.WriteLine(string.Join(" ", frame.Select(b => $"{b:X2}")));
             }
-
-            LogDelta($"cmd=0x{cmd:X2} tns={tns} func=0x{func:X2} sts=0x{status:X2} → \n    TX: ");
-            foreach (byte b in frame) Console.Write($"{b:X2} ");
-            Console.WriteLine();
         }
         catch (Exception ex) { Console.WriteLine("Write error: " + ex.Message); }
     }
