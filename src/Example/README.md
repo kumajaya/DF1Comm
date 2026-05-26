@@ -3,6 +3,12 @@
 **Purpose**  
 Enhanced DF1 client for testing `DF1Comm` against a real PLC or the DF1Emulator. Supports a demo sequence, interactive CLI, communication statistics, and stress testing.
 
+> **⚠️ CAUTION – REAL PLC HAZARD**  
+> This example client **writes data** to the connected PLC (N7, F8, B3, and mode switching).  
+> Running the demo on a **real PLC** will modify its memory and may affect machine operation.  
+> **Only use with a real PLC if you fully understand the consequences.**  
+> For safe testing, use the [DF1Emulator](../DF1Emulator) instead.
+
 ## Features
 - Reads processor type (Get Status, CMD 0x06 FNC 0x03)
 - Reads/writes integers (`N7`, `O0`, `I1`, `B3`)
@@ -168,5 +174,5 @@ DF1>
 Same as the DF1Comm library.
 
 ## See also
-- [DF1Emulator](https://github.com/kumajaya/DF1Emulator) – standalone emulator for testing
+- [DF1Emulator](../DF1Emulator) – standalone emulator for testing
 - [DF1Comm Library Documentation](https://github.com/kumajaya/DF1Comm)
