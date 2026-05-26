@@ -854,11 +854,22 @@ namespace DF1Comm
 
         private readonly object tnsLock = new object();
 
+        /// <summary>
+        /// Increments the TNS (Transaction Number) and returns the new value.
+        /// Also removes any stale response packet associated with the new TNS
+        /// to prevent memory leaks. Old packets are overwritten when TNS wraps around.
+        /// </summary>
         private ushort IncrementAndGetTNS()
         {
             lock (tnsLock)
             {
+                // Increment TNS (wrap from 65535 to 1)
                 TNS = TNS < 65535 ? (ushort)(TNS + 1) : (ushort)1;
+
+                // Remove any leftover packet from a previous transaction using the same TNS.
+                // This prevents memory leaks without interfering with the current transaction.
+                DataPackets.TryRemove(TNS, out _);
+
                 return TNS;
             }
         }
@@ -886,33 +897,29 @@ namespace DF1Comm
 
             if (result == 0 && wait)
             {
-                try
+                result = WaitForResponse(rTNS);
+                if (result == 0)
                 {
-                    result = WaitForResponse(rTNS);
-                    if (result == 0)
+                    if (DataPackets.TryGetValue(rTNS, out byte[]? rxPkt))
                     {
-                        if (DataPackets.TryGetValue(rTNS, out byte[]? rxPkt))
+                        if (Protocol == "DF1")
                         {
-                            if (Protocol == "DF1")
+                            if (rxPkt.Length > 3)
                             {
-                                if (rxPkt.Length > 3)
-                                {
-                                    result = rxPkt[3];
-                                    if (result == 0xF0)
-                                        result = rxPkt[rxPkt.Length - 1] + 0x100;
-                                }
+                                result = rxPkt[3];
+                                if (result == 0xF0)
+                                    result = rxPkt[rxPkt.Length - 1] + 0x100;
                             }
-                            else if (rxPkt.Length > 7)
-                                result = rxPkt[7];
                         }
-                        else result = -8;
+                        else if (rxPkt.Length > 7)
+                            result = rxPkt[7];
                     }
+                    else result = -8;
                 }
-                finally
-                {
-                    // Clean up packet from dictionary to prevent memory leak
-                    DataPackets.TryRemove(rTNS, out _);
-                }
+                // Note: The packet is intentionally NOT removed here.
+                // It remains available for higher-level methods (e.g., GetProcessorType)
+                // to read additional data. The packet will be automatically cleaned up
+                // when the same TNS is reused (see IncrementAndGetTNS).
             }
             return result;
         }
