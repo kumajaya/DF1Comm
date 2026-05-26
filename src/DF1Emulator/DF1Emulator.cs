@@ -233,29 +233,37 @@ public class DF1Emulator : IDisposable
     /// </summary>
     public void Start()
     {
-        // Enumeration for Windows only
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            if (!System.IO.Ports.SerialPort.GetPortNames()
+            // Windows: case-insensitive check against available COM ports
+            if (!SerialPort.GetPortNames()
                     .Contains(_port.PortName, StringComparer.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(
                     $"Port '{_port.PortName}' not found. Available ports: " +
-                    $"{string.Join(", ", System.IO.Ports.SerialPort.GetPortNames())}");
+                    $"{string.Join(", ", SerialPort.GetPortNames())}");
             }
         }
         else
         {
-            // Linux: cek /dev/ttyS* dan /dev/ttyUSB*
-            var ports = System.IO.Directory.GetFiles("/dev", "tty*");
-            if (!ports.Contains($"/dev/{_port.PortName}") &&
-                !ports.Contains(_port.PortName))
+            // Normalize port name for Linux (add /dev/ prefix if needed)
+            string baseName = _port.PortName.Replace("/dev/", "");
+            string fullPath = $"/dev/{baseName}";
+            var ports = Directory.GetFiles("/dev", "tty*");
+            if (ports.Contains(fullPath))
             {
+                _port.PortName = fullPath;  // Normalize to full path
+            }
+            else if (!ports.Contains(_port.PortName))
+            {
+                var likelyPorts = ports.Where(p => p.StartsWith("/dev/ttyUSB")
+                        || p.StartsWith("/dev/ttyS") || p.StartsWith("/dev/ttyACM"));
                 throw new InvalidOperationException(
-                    $"Port '{_port.PortName}' not found.");
+                    $"Port '{_port.PortName}' not found. Available tty devices: " +
+                    $"{string.Join(", ", likelyPorts)}");
             }
         }
-        
+
         try
         {
             _port.Open();
@@ -271,7 +279,7 @@ public class DF1Emulator : IDisposable
         {
             throw new Exception($"Port '{_port.PortName}' is busy. Details: {ex.Message}");
         }
-        catch (Exception ex) 
+        catch (Exception ex)
         {
             throw new Exception($"Failed to open port {_port.PortName}: {ex.Message}");
         }

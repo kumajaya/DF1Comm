@@ -59,8 +59,30 @@ dotnet run --project Example.csproj -- COM1
 | `--stress-test [n]` | Run stress test; `n` = loop count (default: infinite) | – |
 | `--help, -h` | Show usage | – |
 
+### Linux-specific notes
+
+On Linux, serial ports are typically named `/dev/ttyS0`, `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.  
+The example client accepts both formats: with or without the `/dev/` prefix.
+
+```bash
+# Both work:
+dotnet run --project Example.csproj -- ttyUSB0
+dotnet run --project Example.csproj -- /dev/ttyUSB0
+```
+
+If the specified port is not found, the client will display a list of available `tty` devices.
+
+> **Note**: Ensure your user has read/write access to the serial device. Add yourself to the `dialout` group if needed:
+> ```bash
+> sudo usermod -a -G dialout $USER
+> # Log out and back in for changes to take effect
+> ```
+```
+
 ### Example with DF1Emulator (virtual pair)
-1. Create virtual serial pair, e.g. `COM1` ↔ `COM2`.
+
+**Windows** (using com0com):
+1. Create a virtual COM pair, e.g. `COM1` ↔ `COM2`.
 2. Start the emulator on `COM2`:
    ```bash
    dotnet run --project DF1Emulator.csproj -- COM2 --checksum crc
@@ -68,6 +90,20 @@ dotnet run --project Example.csproj -- COM1
 3. In another terminal, run the example client on `COM1`:
    ```bash
    dotnet run --project Example.csproj -- COM1 --target 1 --checksum crc
+   ```
+
+**Linux** (using socat):
+1. Create a virtual serial pair:
+   ```bash
+   socat -d -d pty,raw,echo=0,link=/dev/ttyV0 pty,raw,echo=0,link=/dev/ttyV1
+   ```
+2. Start the emulator on `/dev/ttyV0`:
+   ```bash
+   dotnet run --project ../DF1Emulator/DF1Emulator.csproj -- ttyV0 --checksum crc
+   ```
+3. In another terminal, run the example client on `/dev/ttyV1`:
+   ```bash
+   dotnet run --project Example.csproj -- ttyV1 --target 1 --checksum crc
    ```
 
 ### Stress test example

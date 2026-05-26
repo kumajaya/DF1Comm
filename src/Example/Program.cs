@@ -19,7 +19,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+using System.IO;
 using System.IO.Ports;
+using System.Runtime.InteropServices;
 using Comm = DF1Comm;
 
 /// <summary>
@@ -121,6 +123,46 @@ class Program
         }
     }
 
+    /// <summary>
+    /// Normalizes and validates the serial port name for the current platform.
+    /// On Windows, checks against available COM ports.
+    /// On Linux, accepts both "ttyUSB0" and "/dev/ttyUSB0" formats and resolves to the full path.
+    /// </summary>
+    static string NormalizePortName(string portName)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // Windows: case-insensitive check against available COM ports
+            var available = SerialPort.GetPortNames();
+            if (!available.Contains(portName, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new Exception(
+                    $"Port '{portName}' not found. Available ports: " +
+                    $"{string.Join(", ", available)}");
+            }
+            return portName;
+        }
+        else // Linux, macOS (treat like Linux for tty devices)
+        {
+            // Remove leading "/dev/" if present to get the base name
+            string baseName = portName.Replace("/dev/", "");
+            var ports = Directory.GetFiles("/dev", "tty*");
+            string fullPath = $"/dev/{baseName}";
+
+            if (ports.Contains(fullPath))
+                return fullPath;
+            if (ports.Contains(portName))
+                return portName;
+
+            // Provide a helpful error message listing likely serial devices
+            var likelyPorts = ports.Where(p => p.StartsWith("/dev/ttyUSB")
+                    || p.StartsWith("/dev/ttyS") || p.StartsWith("/dev/ttyACM"));
+            throw new Exception(
+                $"Port '{portName}' not found. Available tty devices: " +
+                $"{string.Join(", ", likelyPorts)}");
+        }
+    }
+
     // ─── Main ─────────────────────────────────────────────────────────
     static void Main(string[] args)
     {
@@ -190,6 +232,9 @@ class Program
                 return;
             }
         }
+
+        // After parsing portName from arguments, normalize and validate it
+        portName = NormalizePortName(portName);
 
         var df1 = new Comm.DF1Comm(portName, baud, parity)
         {

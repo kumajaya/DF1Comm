@@ -49,14 +49,62 @@ dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
 | `--checksum <crc/bcc>` | Checksum mode | `crc` |
 | `--help, -h` | Show usage | – |
 
+## Linux-specific notes
+
+### Serial port naming
+On Linux, serial ports are typically named `/dev/ttyS0`, `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.  
+The emulator accepts both formats: with or without the `/dev/` prefix.
+
+```bash
+# Both work:
+dotnet run --project DF1Emulator.csproj -- ttyUSB0
+dotnet run --project DF1Emulator.csproj -- /dev/ttyUSB0
+```
+
+### Virtual serial pair on Linux
+To test the emulator without physical hardware, create a virtual pair using `socat`:
+
+```bash
+socat -d -d pty,raw,echo=0,link=/dev/ttyV0 pty,raw,echo=0,link=/dev/ttyV1
+```
+
+Then run the emulator on one end and your DF1 client on the other:
+
+```bash
+# Terminal 1 – emulator
+dotnet run --project DF1Emulator.csproj -- ttyV0
+
+# Terminal 2 – client (e.g., DF1Comm example or RSLinx) connected to ttyV1
+```
+
+### Permissions
+Ensure your user has read/write access to the serial device. Add yourself to the `dialout` group if needed:
+
+```bash
+sudo usermod -a -G dialout $USER
+# Log out and back in for changes to take effect
+```
+
 ## Quick test with virtual serial pair
-1. Create a virtual COM pair (e.g., `COM1` ↔ `COM2` using com0com).
+
+### Windows (using com0com)
+1. Create a virtual COM pair (e.g., `COM1` ↔ `COM2`).
 2. Start the emulator on `COM2`:
    ```bash
    dotnet run --project DF1Emulator.csproj -- COM2
    ```
-3. Start your DF1 client (any DF1 master, e.g., DF1Comm or RSLinx) on `COM1`.
-4. Send a **Get Status** (CMD 0x06, FNC 0x03). The emulator replies with processor type `0x49` (SLC 5/03).
+3. Start your DF1 client on `COM1`.
+
+### Linux (using socat)
+1. Create a virtual pair:
+   ```bash
+   socat -d -d pty,raw,echo=0,link=/dev/ttyV0 pty,raw,echo=0,link=/dev/ttyV1
+   ```
+2. Start the emulator on `ttyV0`:
+   ```bash
+   dotnet run --project DF1Emulator.csproj -- ttyV0
+   ```
+3. Connect your DF1 client to `ttyV1`.
 
 ## RSLinx integration
 - Create an **RS-232 DF1** driver in RSLinx.
