@@ -188,7 +188,13 @@ public class DataLink : IDisposable
         {
             _port.Write(new byte[] { DLE, controlByte }, 0, 2);
         }
-        catch { /* ignored, upper layer will detect timeout */ }
+        catch (Exception ex)
+        {
+            // Do not propagate exception from event handler context.
+            // Log if needed, but avoid crashing the receive thread.
+            System.Diagnostics.Debug.WriteLine($"SendControl failed: {ex.Message}");
+            // Optionally set a flag to notify upper layer of communication fault
+        }
     }
 
     /// <summary>Resets the ACK/NAK flags used for ENQ polling.</summary>

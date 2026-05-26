@@ -865,24 +865,32 @@ namespace DF1Comm
 
             if (result == 0 && wait)
             {
-                result = WaitForResponse(rTNS);
-                if (result == 0)
+                try
                 {
-                    if (DataPackets.TryGetValue(rTNS, out byte[]? rxPkt))
+                    result = WaitForResponse(rTNS);
+                    if (result == 0)
                     {
-                        if (Protocol == "DF1")
+                        if (DataPackets.TryGetValue(rTNS, out byte[]? rxPkt))
                         {
-                            if (rxPkt.Length > 3)
+                            if (Protocol == "DF1")
                             {
-                                result = rxPkt[3];
-                                if (result == 0xF0)
-                                    result = rxPkt[rxPkt.Length - 1] + 0x100;
+                                if (rxPkt.Length > 3)
+                                {
+                                    result = rxPkt[3];
+                                    if (result == 0xF0)
+                                        result = rxPkt[rxPkt.Length - 1] + 0x100;
+                                }
                             }
+                            else if (rxPkt.Length > 7)
+                                result = rxPkt[7];
                         }
-                        else if (rxPkt.Length > 7)
-                            result = rxPkt[7];
+                        else result = -8;
                     }
-                    else result = -8;
+                }
+                finally
+                {
+                    // Clean up packet from dictionary to prevent memory leak
+                    DataPackets.TryRemove(rTNS, out _);
                 }
             }
             return result;
