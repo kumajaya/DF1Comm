@@ -1,6 +1,6 @@
 # DF1Comm – DF1 Protocol Library for .NET (C# Port)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![.NET](https://img.shields.io/badge/.NET-8.0-purple)](https://dotnet.microsoft.com/)
 
 **DF1Comm** is a complete, self‑contained C# implementation of the **Allen‑Bradley DF1 full‑duplex protocol** for .NET.  
@@ -11,7 +11,7 @@ It is a **port** of the original **DF1Comm.vb** written by **Archie Jacobs of Ma
 - A **standalone SLC 5/03 emulator** (`DF1Emulator`) for testing without real PLC hardware
 - An **example client** that demonstrates all major library features
 
-All components target .NET 8 and are licensed under **Apache 2.0**.
+All components target .NET 8 and are licensed under GNU General Public License v3.0 or later (GPLv3+).
 
 ---
 
@@ -19,7 +19,7 @@ All components target .NET 8 and are licensed under **Apache 2.0**.
 
 ```
 DF1Comm/
-├── LICENSE                         (Apache 2.0)
+├── LICENSE                         (GNU GPL v3.0)
 ├── README.md                       (this file)
 ├── src/
 │   ├── DF1Comm/                    # Core library (C# port of DF1Comm.vb)
@@ -55,7 +55,7 @@ DF1Comm/
 
 ### DF1Comm Library (C# Port)
 - Full‑duplex DF1 framing (DLE STX / DLE ETX with DLE stuffing)
-- **BCC** (XOR) and **CRC‑16** (Modbus polynomial 0xA001) checksum support
+- **BCC** (XOR) and **CRC‑16** (calculation as per AB specification) checksum support
 - Read/write any data type: **integers, floats, bits, strings, timers, counters**
 - Switch processor between **RUN** and **PROGRAM** modes
 - Auto‑detect communication settings (baud, parity, checksum) via `DetectCommSettings()`
@@ -73,10 +73,10 @@ DF1Comm/
 - Console hex logging for debugging
 
 ### Example Client
-- Demonstrates all major library APIs
-- Reads processor type, data files, and specific addresses
-- Writes integers, floats, and bits
-- Switches RUN/PROGRAM mode
+- Demo sequence: reads processor type, data files, and specific addresses; writes integers, floats, and bits; toggles RUN/PROGRAM mode
+- **Interactive CLI** (`DF1>` prompt) with read, write, writestring, sendhex, mode, stats, and more
+- **Communication statistics** – total requests, successes, timeouts, NAKs, other errors, error rate
+- **Stress test mode** – continuous read loop with configurable iteration count (`--stress-test [n]`)
 - Can be used with **real PLC** or **DF1Emulator** over a virtual serial pair
 
 ---
@@ -124,7 +124,7 @@ dotnet build -c Release src/Example/Example.csproj
 ### 1. Using the DF1Comm Library
 
 ```csharp
-using DF1Comm.Communication;
+using DF1Comm;
 
 var df1 = new DF1Comm("COM1", 19200, Parity.None)
 {
@@ -155,7 +155,7 @@ df1.CloseComms();
 ### 2. Running the Emulator
 
 ```bash
-dotnet run --project src/DF1Emulator -- COM2 --baud 19200 --checksum bcc
+dotnet run --project src/DF1Emulator -- COM2 --baud 19200 --checksum crc
 ```
 
 See `src/DF1Emulator/README.md` for full emulator documentation.
@@ -166,7 +166,9 @@ See `src/DF1Emulator/README.md` for full emulator documentation.
 dotnet run --project src/Example -- COM1 --target 1 --checksum crc
 ```
 
-See `src/Example/README.md` for client details.
+The client runs a demo sequence, prints communication statistics, then enters an interactive CLI (`DF1>` prompt). Use `--interactive-only` to skip the demo, `--no-interactive` to skip the CLI, or `--stress-test [n]` for continuous load testing.
+
+See `src/Example/README.md` for full client documentation.
 
 ### 4. Testing Emulator + Client Together
 
@@ -198,7 +200,7 @@ The implementation follows **Allen‑Bradley Publication 1770‑6.5.16** (DF1 Pr
 
 Checksum modes:
 - **BCC**: XOR of all bytes in the payload, then two's complement.
-- **CRC‑16**: Initial value `0x0000`, polynomial `0xA001` (Modbus), ETX byte `0x03` included.
+- **CRC‑16**: Initial value `0x0000`, polynomial `0xA001` (as per AB specification), ETX byte `0x03` included.
 
 ---
 
@@ -229,27 +231,40 @@ Please keep all code **self‑contained** (avoid external dependencies except `S
 
 ## License
 
-**The original DF1Comm.vb** (by Archie Jacobs, Manufacturing Automation LLC) was released under the **GNU General Public License**.  
-
-**This C# port and all additional components (emulator, example client, modernised project structure) are licensed under the Apache License, Version 2.0.**  
-
-```
+**DF1Comm – C# port of DF1Comm.vb**  
 Copyright (c) 2026 Ketut Kumajaya
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+The original **DF1Comm.vb** (by Archie Jacobs, Manufacturing Automation LLC) was released under the  
+**GNU General Public License, version 2 or any later version**.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+This C# port, the DF1Emulator, and the Example Client are **derived works** of the original VB code.  
+Therefore, they are also licensed under the **GNU General Public License v3.0 or any later version**.
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+```
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
 ```
 
 Full text in [`LICENSE`](LICENSE) file.
+
+---
+
+### Compatibility with Other Projects
+
+- **GPLv3 is compatible with Apache 2.0 only in one direction:** Apache 2.0 code can be combined with GPLv3 code, but the combined work must be distributed under GPLv3.  
+- If you need to use this library in a proprietary or Apache‑licensed project, you must keep it as a **separate plugin/component** loaded dynamically, without merging code into your main application.
+
+See the [GNU license compatibility FAQ](https://www.gnu.org/licenses/license-compatibility.en.html) for details.
 
 ---
 

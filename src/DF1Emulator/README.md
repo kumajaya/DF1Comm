@@ -51,11 +51,11 @@ dotnet run --project DF1Emulator.csproj -- COM3 --baud 9600 --parity even
 
 ## Quick test with virtual serial pair
 1. Create a virtual COM pair (e.g., `COM1` ↔ `COM2` using com0com).
-2. Start the emulator on `COM1`:
+2. Start the emulator on `COM2`:
    ```bash
-   dotnet run --project DF1Emulator.csproj -- COM1
+   dotnet run --project DF1Emulator.csproj -- COM2
    ```
-3. Start your DF1 client (any DF1 master, e.g., DF1Comm or RSLinx) on `COM2`.
+3. Start your DF1 client (any DF1 master, e.g., DF1Comm or RSLinx) on `COM1`.
 4. Send a **Get Status** (CMD 0x06, FNC 0x03). The emulator replies with processor type `0x49` (SLC 5/03).
 
 ## RSLinx integration
