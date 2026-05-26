@@ -185,11 +185,25 @@ namespace DF1Comm
             return reply;
         }
 
+        /// <summary>
+        /// Gets the current processor mode (RUN or PROGRAM).
+        /// Uses Diagnostic Status command (CMD 0x06, FNC 0x03) and reads mode code at byte 18.
+        /// Returns 1 if in RUN mode (Local or Remote), 0 if in PROGRAM mode, -1 on error.
+        /// Reference: AB Publication 1770-6.5.16 Chapter 10.
+        /// </summary>
         public int GetRunMode()
         {
-            int result = PrefixAndSend(0x06, 0x01, new byte[0], true, out int rTNS);
-            if (result == 0 && DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 6)
-                return pkt[6];
+            byte[] data = Array.Empty<byte>();
+            int reply = PrefixAndSend(0x06, 0x03, data, true, out int rTNS);
+            if (reply != 0)
+                return -1;
+
+            if (DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 24)
+            {
+                byte modeCode = pkt[24]; // mode code at byte 24 (6 header + 18 payload)
+                // RUN modes: 0x06 = Remote RUN, 0x1E = Local RUN
+                return (modeCode == 0x06 || modeCode == 0x1E) ? 1 : 0;
+            }
             return -1;
         }
 
