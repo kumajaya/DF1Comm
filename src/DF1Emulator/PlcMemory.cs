@@ -140,12 +140,15 @@ public class PlcMemory
         Reg(file0, pos, 0x85, 82, 16, 2); pos += 10; // B16
         Reg(file0, pos, 0x89, 52, 17, 2); pos += 10; // N17
 
-        // File numbers 18..28 — inactive (allocated slots, no data)
-        // Real PLC shows Total Files=32 but Active Files=21; files 18-28 exist as
-        // empty directory entries (fileType=0x00, size=0) occupying allocated slots.
+        // File numbers 18..28 — inactive (allocated slots, no data).
+        // Real PLC shows Total Files = 32 but Active Files = 21. Files 18-28 exist as
+        // empty directory entries occupying allocated slots. They are set as null strings
+        // (type 0x8D, size 0) because SLC 5/03 does not support the String data type.
+        // As a result, RSLogix and RSLinx will not display these files, but the emulator
+        // can still read/write them for upload/download purposes.
         for (int n = 18; n <= 28; n++)
         {
-            file0[pos]     = 0x00; // fileType = 0 (unused/inactive)
+            file0[pos]     = 0x8D; // fileType = ST (string)
             file0[pos + 1] = 0x00; // size lo = 0
             file0[pos + 2] = 0x00; // size hi = 0
             file0[pos + 3] = (byte)n; // file number

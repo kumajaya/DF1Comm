@@ -572,7 +572,13 @@ public class DF1Emulator : IDisposable
                     case 0x68: // Protected Typed Logical Read (three address fields) – AB Application Note, page 6
                         HandleReadRequest(src, tns, func, data);
                         break;
+                    case 0x11: // Get Edit Resource (secure sole access)
+                    case 0x12: // Return Edit Resource
                     case 0x29: // Unrecognised function code sent by RSLinx during auto-configure
+                    case 0x52: // Download Completed
+                    case 0x88: // Execute Command List (download initialization)
+                        // DF1Comm sends data (16 bytes) as per DownloadProgramData.
+                        // No need to process; just acknowledge success.
                         SendFrameWithoutFunc(src, MyNode, 0x4F, tns, func, 0x00, Array.Empty<byte>());
                         break;
                     default:
