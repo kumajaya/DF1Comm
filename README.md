@@ -28,12 +28,12 @@ DF1Comm/
 │   │   ├── DF1Exception.cs
 │   │   ├── Models.cs
 │   │   ├── Core/
-│   │   |   ├── AddressParser.cs
-│   │   |   ├── DataLink.cs
-│   │   |   ├── MessageDecoder.cs
-│   │   |   ├── PacketBuilder.cs
-│   │   |   ├── SerialPortWrapper.cs
-│   │   |   └── StringConverter.cs
+│   │   │   ├── AddressParser.cs
+│   │   │   ├── DataLink.cs
+│   │   │   ├── MessageDecoder.cs
+│   │   │   ├── PacketBuilder.cs
+│   │   │   ├── SerialPortWrapper.cs
+│   │   │   └── StringConverter.cs
 │   │   └── DF1Comm.csproj
 │   ├── DF1Emulator/                # SLC 5/03 emulator (standalone)
 │   │   ├── DF1Emulator.cs
@@ -41,6 +41,13 @@ DF1Comm/
 │   │   ├── PlcMemory.cs
 │   │   ├── Program.cs
 │   │   ├── DF1Emulator.csproj
+│   │   └── README.md
+│   ├── DF1ProgramTool/               # Desktop GUI for upload/download
+│   │   ├── Views/
+│   │   ├── ViewModels/
+│   │   ├── Models/
+│   │   ├── Services/
+│   │   ├── DF1ProgramTool.csproj
 │   │   └── README.md
 │   └── Example/                    # Example client application
 │       ├── Program.cs
@@ -55,7 +62,7 @@ DF1Comm/
 
 ### DF1Comm Library (C# Port)
 - Full‑duplex DF1 framing (DLE STX / DLE ETX with DLE stuffing)
-- **BCC** (XOR) and **CRC‑16** (calculation as per AB specification) checksum support
+- **BCC** and **CRC‑16** (calculation as per AB specification) checksum support
 - Read/write any data type: **integers, floats, bits, strings, timers, counters**
 - Switch processor between **RUN** and **PROGRAM** modes
 - Auto‑detect communication settings (baud, parity, checksum) via `DetectCommSettings()`
@@ -78,6 +85,14 @@ DF1Comm/
 - **Communication statistics** – total requests, successes, timeouts, NAKs, other errors, error rate
 - **Stress test mode** – continuous read loop with configurable iteration count (`--stress-test [n]`)
 - Can be used with **real PLC** or **DF1Emulator** over a virtual serial pair
+
+### DF1ProgramTool (Desktop GUI)
+- Cross‑platform GUI built with Avalonia UI
+- Upload entire PLC program to a binary file
+- Download previously saved program back to the PLC
+- Supports SLC 5/01–5/05 and MicroLogix 1000/1500
+- Automatic PLC detection and descriptive filename generation
+- Progress indication during transfer
 
 ---
 
@@ -182,6 +197,25 @@ See `src/Example/README.md` for full client documentation.
    dotnet run --project src/Example -- COM1 --checksum crc
    ```
 
+### 5. Running the GUI Tool (DF1ProgramTool)
+
+```bash
+dotnet run --project src/DF1ProgramTool
+```
+
+The tool presents a graphical interface where you can select the COM port, baud rate, parity, and node ID. After connecting, the processor type is automatically detected. Upload/download buttons are enabled only for supported PLC families (SLC and MicroLogix).  
+See `src/DF1ProgramTool/README.md` for full documentation.
+
+### 6. Testing Emulator + DF1ProgramTool Together
+
+1. Create a virtual serial pair (e.g. `COM1` ↔ `COM2`).
+2. Start emulator on `COM2`:
+   ```bash
+   dotnet run --project src/DF1Emulator -- COM2 --checksum crc
+   ```
+3. Start DF1ProgramTool and connect to `COM1`.
+4. Upload from the emulator, then download – the emulator will respond correctly.
+
 ---
 
 ## Protocol Reference
@@ -198,9 +232,9 @@ The implementation follows **Allen‑Bradley Publication 1770‑6.5.16** (DF1 Pr
 | `0x67` (Read Modified Data) | Simplified read variant |
 | `0xF` (Execute Command List) | Multi‑function commands (mode change, I/O config, upload/download) |
 
-Checksum modes:
-- **BCC**: XOR of all bytes in the payload, then two's complement.
-- **CRC‑16**: Initial value `0x0000`, polynomial `0xA001` (as per AB specification), ETX byte `0x03` included.
+Checksum modes as per AB specification:
+- **BCC**: uses two's complement of sum.
+- **CRC‑16**: Initial value `0x0000`, polynomial `0xA001`, ETX byte `0x03` included.
 
 ---
 
@@ -279,3 +313,4 @@ See the [GNU license compatibility FAQ](https://www.gnu.org/licenses/license-com
 
 - [DF1Emulator](src/DF1Emulator/README.md) – standalone emulator
 - [Example Client](src/Example/README.md) – usage demonstration
+- [DF1ProgramTool](src/DF1ProgramTool/README.md) – desktop GUI for upload/download
