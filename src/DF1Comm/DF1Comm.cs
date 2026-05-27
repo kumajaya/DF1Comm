@@ -108,6 +108,20 @@ namespace DF1Comm
         public event EventHandler? DownloadProgress;
         public event EventHandler? UploadProgress;
 
+        // Events for logging support
+        public event EventHandler<byte[]>? RawFrameSent
+        {
+            add => dataLink.RawFrameSent += value;
+            remove => dataLink.RawFrameSent -= value;
+        }
+
+        // Events for logging support
+        public event EventHandler<byte[]>? RawFrameReceived
+        {
+            add => dataLink.RawFrameReceived += value;
+            remove => dataLink.RawFrameReceived -= value;
+        }
+
         private int responseTimeoutMs = 2000;
         /// <summary>
         /// Gets or sets the response timeout in milliseconds. Default is 2000 ms.

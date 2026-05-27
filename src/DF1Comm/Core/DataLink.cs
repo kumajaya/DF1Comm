@@ -64,6 +64,10 @@ public class DataLink : IDisposable
     /// <summary>Raised when the remote sends ENQ (0x10 0x05).</summary>
     public event EventHandler? EnqReceived;
 
+    // Events for logging support
+    public event EventHandler<byte[]>? RawFrameSent;
+    public event EventHandler<byte[]>? RawFrameReceived;
+
     // ─── Properties ───────────────────────────────────────────────────────────
     public CheckSumOptions ChecksumType
     {
@@ -157,6 +161,7 @@ public class DataLink : IDisposable
 
             try
             {
+                RawFrameSent?.Invoke(this, frame);
                 _port.Write(frame, 0, frame.Length);
             }
             catch
@@ -207,6 +212,7 @@ public class DataLink : IDisposable
             throw new ArgumentException("Invalid control byte", nameof(controlByte));
         try
         {
+            RawFrameSent?.Invoke(this, new byte[] { DLE, controlByte });
             _port.Write(new byte[] { DLE, controlByte }, 0, 2);
         }
         catch (Exception ex)
@@ -368,6 +374,7 @@ public class DataLink : IDisposable
                     // Extract frame
                     byte[] frame = new byte[totalFrameLen];
                     _rxBuffer.CopyTo(0, frame, 0, totalFrameLen);
+                    RawFrameReceived?.Invoke(this, frame);
                     _rxBuffer.RemoveRange(0, totalFrameLen);
                     _frameStartTime = DateTime.MinValue;
 
