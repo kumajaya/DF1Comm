@@ -3,9 +3,9 @@ using System.Collections.ObjectModel;
 using System.IO.Ports;
 using System.Reactive;
 using System.Reactive.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Layout;
@@ -25,22 +25,30 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     private PlcInfo _currentPlcInfo = new(0, "Unknown", false, "Unknown");
     private bool _disposed;
 
+    // Log buffer – capped at MaxLogLines
+    private readonly StringBuilder _logBuffer = new();
+    private int _logLineCount;
+    private const int MaxLogLines = 500;
+
     // ─── Backing fields ───────────────────────────────────────────────────────
-    private bool   _isBusy;
-    private bool   _isConnected;
-    private string _statusText     = "Not connected";
-    private double _progressValue;
-    private string _progressMessage = string.Empty;
-    private string _selectedPort    = string.Empty;
-    private int    _selectedBaud    = 19200;
-    private string _selectedParity  = "None";
-    private decimal _targetNode     = 1;   // decimal for NumericUpDown two-way binding
-    private decimal _myNode         = 0;
+    private bool    _isBusy;
+    private bool    _isConnected;
+    private string  _statusText      = "Not connected";
+    private double  _progressValue;
+    private string  _progressMessage = string.Empty;
+    private string  _selectedPort    = string.Empty;
+    private int     _selectedBaud    = 19200;
+    private string  _selectedParity  = "None";
+    private string  _selectedChecksum  = "Crc";
+    private decimal _targetNode      = 1;
+    private decimal _myNode          = 0;
+    private string  _logText         = string.Empty;
 
     // ─── Observable collections ───────────────────────────────────────────────
-    public ObservableCollection<string> AvailablePorts  { get; } = new();
-    public ObservableCollection<int>    BaudRates        { get; } = new() { 9600, 19200, 38400 };
-    public ObservableCollection<string> ParityOptions    { get; } = new() { "None", "Even", "Odd" };
+    public ObservableCollection<string> AvailablePorts { get; } = new();
+    public ObservableCollection<int>    BaudRates      { get; } = new() { 9600, 19200, 38400 };
+    public ObservableCollection<string> ParityOptions  { get; } = new() { "None", "Even", "Odd" };
+    public ObservableCollection<string> ChecksumOptions { get; } = new() { "Crc", "Bcc" };
 
     // ─── Properties ───────────────────────────────────────────────────────────
     public string SelectedPort
@@ -61,7 +69,12 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         set => this.RaiseAndSetIfChanged(ref _selectedParity, value);
     }
 
-    /// <summary>NumericUpDown requires decimal? binding; clamped to 0–31 in the view.</summary>
+    public string SelectedChecksum
+    {
+        get => _selectedChecksum;
+        set => this.RaiseAndSetIfChanged(ref _selectedChecksum, value);
+    }
+
     public decimal TargetNode
     {
         get => _targetNode;
@@ -80,7 +93,6 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         private set
         {
             this.RaiseAndSetIfChanged(ref _isBusy, value);
-            // Force re-evaluation of derived reactive properties
             this.RaisePropertyChanged(nameof(CanUpload));
             this.RaisePropertyChanged(nameof(CanDownload));
         }
@@ -115,7 +127,16 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         private set => this.RaiseAndSetIfChanged(ref _progressMessage, value);
     }
 
-    // Computed – no backing field needed; notified manually from IsBusy / IsConnected setters
+    /// <summary>
+    /// Append-only log string bound to a read-only TextBox.
+    /// Raises PropertyChanged on every append so the view can scroll to end.
+    /// </summary>
+    public string LogText
+    {
+        get => _logText;
+        private set => this.RaiseAndSetIfChanged(ref _logText, value);
+    }
+
     public bool CanUpload   => IsConnected && !IsBusy && _currentPlcInfo.SupportsUploadDownload;
     public bool CanDownload => IsConnected && !IsBusy && _currentPlcInfo.SupportsUploadDownload;
 
@@ -125,28 +146,79 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     public ReactiveCommand<Unit, Unit> DisconnectCommand   { get; }
     public ReactiveCommand<Unit, Unit> UploadCommand       { get; }
     public ReactiveCommand<Unit, Unit> DownloadCommand     { get; }
+    public ReactiveCommand<Unit, Unit> ClearLogCommand     { get; }
+
+    private void OnRawFrameSent(object? sender, byte[] frame)     => AppendLog($"TX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
+    private void OnRawFrameReceived(object? sender, byte[] frame) => AppendLog($"RX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
 
     // ─── Constructor ─────────────────────────────────────────────────────────
     public MainWindowViewModel()
     {
-        // canExecute observables derived from reactive properties
-        var notBusy      = this.WhenAnyValue(x => x.IsBusy).Select(b => !b);
-        var canConnect   = this.WhenAnyValue(x => x.IsBusy, x => x.IsConnected,
-                               (busy, connected) => !busy && !connected);
-        var canTransfer  = this.WhenAnyValue(x => x.CanUpload); // re-notified on IsBusy/IsConnected
+        var notBusy     = this.WhenAnyValue(x => x.IsBusy).Select(b => !b);
+        var canConnect  = this.WhenAnyValue(x => x.IsBusy, x => x.IsConnected,
+                              (busy, connected) => !busy && !connected);
+        var canUpload   = this.WhenAnyValue(x => x.CanUpload);
+        var canDownload = this.WhenAnyValue(x => x.CanDownload);
 
         RefreshPortsCommand = ReactiveCommand.Create(RefreshPorts, notBusy);
         ConnectCommand      = ReactiveCommand.CreateFromTask(ConnectAsync, canConnect);
         DisconnectCommand   = ReactiveCommand.Create(Disconnect,
                                   this.WhenAnyValue(x => x.IsConnected));
-
-        // Upload/Download use their own canExecute observables
-        var canUpload   = this.WhenAnyValue(x => x.CanUpload);
-        var canDownload = this.WhenAnyValue(x => x.CanDownload);
-        UploadCommand   = ReactiveCommand.CreateFromTask(UploadAsync,   canUpload);
-        DownloadCommand = ReactiveCommand.CreateFromTask(DownloadAsync, canDownload);
+        UploadCommand       = ReactiveCommand.CreateFromTask(UploadAsync,   canUpload);
+        DownloadCommand     = ReactiveCommand.CreateFromTask(DownloadAsync, canDownload);
+        ClearLogCommand     = ReactiveCommand.Create(ClearLog);
 
         RefreshPorts();
+    }
+
+    // ─── Logging ─────────────────────────────────────────────────────────────
+    private void AppendLog(string line)
+    {
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            // Remove oldest line if buffer exceeds max allowed lines
+            if (_logLineCount >= MaxLogLines)
+            {
+                string s = _logBuffer.ToString();
+                int nl = s.IndexOf('\n');
+                if (nl >= 0)
+                    _logBuffer.Remove(0, nl + 1);
+                else
+                    _logBuffer.Clear();
+                _logLineCount--;
+            }
+
+            string timeStamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            _logBuffer.Append(timeStamp);
+            _logBuffer.Append("  ");
+
+            // If line contains a newline (TX/RX + decoded payload), indent the second line
+            if (line.Contains('\n'))
+            {
+                int idx = line.IndexOf('\n');
+                string firstLine = line.Substring(0, idx);
+                string secondLine = line.Substring(idx + 1);
+                _logBuffer.AppendLine(firstLine);
+                // Indent second line to align with text after timestamp
+                _logBuffer.Append(new string(' ', timeStamp.Length + 2));
+                _logBuffer.Append(secondLine);
+                _logBuffer.AppendLine();
+            }
+            else
+            {
+                _logBuffer.AppendLine(line);
+            }
+
+            _logLineCount++;
+            LogText = _logBuffer.ToString();
+        });
+    }
+
+    private void ClearLog()
+    {
+        _logBuffer.Clear();
+        _logLineCount = 0;
+        LogText = string.Empty;
     }
 
     // ─── Port management ─────────────────────────────────────────────────────
@@ -170,6 +242,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         IsBusy = true;
         StatusText = "Connecting…";
+        AppendLog($"Connecting to {SelectedPort} @ {SelectedBaud} baud ({SelectedParity} parity, {SelectedChecksum} checksum)…");
 
         try
         {
@@ -180,27 +253,30 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
                 _      => Parity.None
             };
 
-            // Dispose any previous instance
             DisposeDF1();
 
             _df1 = new global::DF1Comm.DF1Comm(SelectedPort, SelectedBaud, parity)
             {
                 TargetNode = (int)TargetNode,
                 MyNode     = (int)MyNode,
-                CheckSum   = CheckSumOptions.Crc,
+                CheckSum   = SelectedChecksum == "Crc" ? CheckSumOptions.Crc : CheckSumOptions.Bcc,
                 Protocol   = "DF1"
             };
 
             await Task.Run(() => _df1.OpenComms());
+            AppendLog("Port opened.");
 
             var plcInfo = await PlcIdentifier.IdentifyAsync(_df1);
             _currentPlcInfo = plcInfo;
+            AppendLog($"Identified: {plcInfo.Name} (0x{plcInfo.ProcessorType:X2})  " +
+                      $"Family={plcInfo.Family}  Upload/Download={plcInfo.SupportsUploadDownload}");
 
             if (plcInfo.SupportsUploadDownload)
             {
                 int mode = await Task.Run(() => _df1.GetRunMode());
                 string modeStr = mode == 1 ? "RUN" : "PROG";
                 StatusText = $"Connected | {plcInfo.Name} | {modeStr}";
+                AppendLog($"Mode: {modeStr}");
             }
             else
             {
@@ -208,9 +284,13 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             }
 
             IsConnected = true;
+
+            _df1.RawFrameSent     += OnRawFrameSent;
+            _df1.RawFrameReceived += OnRawFrameReceived;
         }
         catch (Exception ex)
         {
+            AppendLog($"ERROR: {ex.Message}");
             DisposeDF1();
             StatusText = "Connection failed";
             await ShowMessageAsync("Connection Error", ex.Message);
@@ -223,10 +303,34 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
     private void Disconnect()
     {
+        AppendLog("Disconnecting…");
         DisposeDF1();
         _currentPlcInfo = new(0, "Unknown", false, "Unknown");
         IsConnected     = false;
         StatusText      = "Disconnected";
+        AppendLog("Disconnected.");
+    }
+
+    /// <summary>
+    /// Refresh PLC status (mode and processor info) after upload/download.
+    /// Updates StatusText and optionally _currentPlcInfo if processor type changed.
+    /// </summary>
+    private async Task RefreshPlcStatusAsync()
+    {
+        if (_df1 == null) return;
+        try
+        {
+            // Re-read processor type mode           
+            int mode = await Task.Run(() => _df1.GetRunMode());
+            string modeStr = mode == 1 ? "RUN" : "PROG";
+            string name = _currentPlcInfo.Name;
+            StatusText = $"Connected | {name} | {modeStr}";
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't disrupt UI
+            AppendLog($"Failed to refresh PLC status: {ex.Message}");
+        }
     }
 
     // ─── Upload ──────────────────────────────────────────────────────────────
@@ -237,7 +341,6 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         var topLevel = GetMainWindow();
         if (topLevel == null) return;
 
-        // Resolve mode string before building the filename
         string modeStr;
         try   { modeStr = await Task.Run(() => _df1.GetRunMode()) == 1 ? "RUN" : "PROG"; }
         catch { modeStr = "UNKNOWN"; }
@@ -247,10 +350,10 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         var saveFile = await topLevel.StorageProvider.SaveFilePickerAsync(
             new Avalonia.Platform.Storage.FilePickerSaveOptions
             {
-                Title              = "Save PLC Program",
-                SuggestedFileName  = defaultFileName,
-                DefaultExtension   = "bin",
-                FileTypeChoices    = new[]
+                Title             = "Save PLC Program",
+                SuggestedFileName = defaultFileName,
+                DefaultExtension  = "bin",
+                FileTypeChoices   = new[]
                 {
                     new Avalonia.Platform.Storage.FilePickerFileType("Binary file")
                         { Patterns = new[] { "*.bin" } },
@@ -279,8 +382,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         var openFiles = await topLevel.StorageProvider.OpenFilePickerAsync(
             new Avalonia.Platform.Storage.FilePickerOpenOptions
             {
-                Title         = "Select PLC Program File",
-                AllowMultiple = false,
+                Title          = "Select PLC Program File",
+                AllowMultiple  = false,
                 FileTypeFilter = new[]
                 {
                     new Avalonia.Platform.Storage.FilePickerFileType("Binary file")
@@ -310,27 +413,36 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         Func<IProgress<string>, IProgress<double>, CancellationToken, Task> work,
         string operationName)
     {
-        IsBusy        = true;
-        ProgressValue = 0;
+        IsBusy          = true;
+        ProgressValue   = 0;
         ProgressMessage = string.Empty;
+        AppendLog($"--- {operationName} started ---");
 
         _cts = new CancellationTokenSource();
 
-        var progressMsg = new Progress<string>(msg => ProgressMessage = msg);
-        var progressPct = new Progress<double>(pct => ProgressValue   = pct);
+        var progressMsg = new Progress<string>(msg =>
+        {
+            ProgressMessage = msg;
+            AppendLog(msg);
+        });
+        var progressPct = new Progress<double>(pct => ProgressValue = pct);
 
         try
         {
             await work(progressMsg, progressPct, _cts.Token);
+            AppendLog($"--- {operationName} complete ---");
+            await RefreshPlcStatusAsync();
             await ShowMessageAsync($"{operationName} Complete",
                 $"{operationName} finished successfully.");
         }
         catch (OperationCanceledException)
         {
+            AppendLog($"--- {operationName} cancelled ---");
             await ShowMessageAsync("Cancelled", $"{operationName} was cancelled.");
         }
         catch (Exception ex)
         {
+            AppendLog($"ERROR: {ex.Message}");
             await ShowMessageAsync($"{operationName} Error", ex.Message);
         }
         finally
@@ -343,69 +455,58 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         }
     }
 
-    // ─── Dialog helpers (native Avalonia – no external package needed) ───────
+    // ─── Dialog helpers ───────────────────────────────────────────────────────
     private static async Task ShowMessageAsync(string title, string message)
     {
-        var tcs = new TaskCompletionSource();
+        var tcs      = new TaskCompletionSource();
         var okButton = new Button { Content = "OK", Width = 80,
             HorizontalAlignment = HorizontalAlignment.Center };
-
-        var dialog = BuildDialog(title, message, okButton);
+        var dialog   = BuildDialog(title, message, okButton);
         okButton.Click += (_, _) => dialog.Close();
-        dialog.Closed += (_, _) => tcs.TrySetResult();
-
+        dialog.Closed  += (_, _) => tcs.TrySetResult();
         var owner = GetMainWindow();
-        if (owner != null)
-            await dialog.ShowDialog(owner);
-        else
-            dialog.Show();
-
+        if (owner != null) await dialog.ShowDialog(owner);
+        else               dialog.Show();
         await tcs.Task;
     }
 
     private static async Task<bool> ShowConfirmAsync(string title, string message)
     {
-        var tcs = new TaskCompletionSource<bool>();
+        bool result   = false;   // default: No / dismissed
         var yesButton = new Button { Content = "Yes", Width = 70 };
         var noButton  = new Button { Content = "No",  Width = 70 };
-
         var buttonRow = new StackPanel
         {
-            Orientation           = Orientation.Horizontal,
-            HorizontalAlignment   = HorizontalAlignment.Center,
-            Spacing               = 16,
-            Children              = { yesButton, noButton }
+            Orientation         = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Spacing             = 16,
+            Children            = { yesButton, noButton }
         };
-
         var dialog = BuildDialog(title, message, buttonRow);
-        
-        // Set result when user clicks a button
-        yesButton.Click += (_, _) => { dialog.Close(); tcs.TrySetResult(true);  };
-        noButton .Click += (_, _) => { dialog.Close(); tcs.TrySetResult(false); };
-        
-        // DO NOT add a Closed handler here – it would overwrite the button result.
+
+        // Buttons set the result then close.
+        // Closing via Alt+F4 / X leaves result = false (treat as cancel).
+        yesButton.Click += (_, _) => { result = true;  dialog.Close(); };
+        noButton .Click += (_, _) => { result = false; dialog.Close(); };
 
         var owner = GetMainWindow();
-        if (owner != null)
-            await dialog.ShowDialog(owner);
-        else
-            dialog.Show(); // Fallback, but may not block properly
+        if (owner != null) await dialog.ShowDialog(owner);
+        else               dialog.Show();
 
-        return await tcs.Task;
+        return result;
     }
 
-    private static Window BuildDialog(string title, string message, Control actionControl)
-    {
-        return new Window
+    private static Window BuildDialog(string title, string message, Control actionControl) =>
+        new()
         {
-            Title                   = title,
-            Width                   = 340,
-            SizeToContent           = SizeToContent.Height,
-            CanResize               = false,
-            WindowStartupLocation   = WindowStartupLocation.CenterOwner,
-            Content                 = new StackPanel
+            Title                 = title,
+            Width                 = 340,
+            SizeToContent         = SizeToContent.Height,
+            CanResize             = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content               = new StackPanel
             {
-                Margin  = new Thickness(20, 16),
+                Margin  = new Avalonia.Thickness(20, 16),
                 Spacing = 16,
                 Children =
                 {
@@ -420,21 +521,23 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
                 }
             }
         };
-    }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
-    private static Avalonia.Controls.Window? GetMainWindow()
+    private static Window? GetMainWindow()
     {
         if (Avalonia.Application.Current?.ApplicationLifetime
                 is IClassicDesktopStyleApplicationLifetime desktop)
-            return desktop.MainWindow as Avalonia.Controls.Window;
+            return desktop.MainWindow as Window;
         return null;
     }
 
     private void DisposeDF1()
     {
-        try { _df1?.CloseComms(); } catch { /* ignore */ }
-        _df1?.Dispose();
+        if (_df1 == null) return;
+        _df1.RawFrameSent     -= OnRawFrameSent;
+        _df1.RawFrameReceived -= OnRawFrameReceived;
+        try { _df1.CloseComms(); } catch { /* ignore */ }
+        _df1.Dispose();
         _df1 = null;
     }
 
