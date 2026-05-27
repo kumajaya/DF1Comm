@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO.Ports;
 using System.Reactive;
 using System.Reactive.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -228,8 +230,28 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     private void RefreshPorts()
     {
         AvailablePorts.Clear();
-        foreach (var p in SerialPort.GetPortNames())
+        var ports = SerialPort.GetPortNames();
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            if (ports == null || ports.Length == 0)
+            {
+                ports = new[] { "/dev/ttyS0", "/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyS31" };
+            }
+            else
+            {
+                var list = new List<string>(ports);
+                foreach (var p in new[] { "/dev/ttyS0", "/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyS31" })
+                {
+                    if (!list.Contains(p)) list.Add(p);
+                }
+                ports = list.ToArray();
+            }
+        }
+
+        foreach (var p in ports)
             AvailablePorts.Add(p);
+
         if (AvailablePorts.Count > 0)
             SelectedPort = AvailablePorts[0];
     }

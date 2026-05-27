@@ -47,6 +47,7 @@ DF1Comm/
 │   │   ├── ViewModels/
 │   │   ├── Models/
 │   │   ├── Services/
+│   │   ├── Utilities/
 │   │   ├── DF1ProgramTool.csproj
 │   │   └── README.md
 │   └── Example/                    # Example client application

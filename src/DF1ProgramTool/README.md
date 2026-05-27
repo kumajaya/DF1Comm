@@ -45,16 +45,30 @@ dotnet run --project src/DF1ProgramTool
 
 ## Linux-specific notes
 
-### Serial port naming
-On Linux, serial ports are typically named `/dev/ttyS0`, `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.  
-The program automatically normalises the port name – you can type `ttyUSB0` or `/dev/ttyUSB0`.
-
 ### Permissions
 Ensure your user has read/write access to the serial device. Add yourself to the `dialout` group if needed:
 ```bash
 sudo usermod -a -G dialout $USER
 # Log out and back in for changes to take effect
 ```
+
+### No serial ports detected
+
+On some Linux systems, `SerialPort.GetPortNames()` may return an empty list even when devices are present.  
+DF1ProgramTool detects this and provides a fallback list of typical device names:
+
+- `/dev/ttyS0`   – legacy serial port
+- `/dev/ttyUSB0` – USB‑to‑serial adapter (most common)
+- `/dev/ttyACM0` – Arduino / modem style devices
+- `/dev/ttyS31`  – a high‑numbered port intended for symbolic links
+
+If your device uses a different name (e.g. `/dev/ttyUSB1`), you can create a symlink to one of the listed names:
+
+```bash
+sudo ln -s /dev/ttyUSB1 /dev/ttyS31
+```
+
+Then select `/dev/ttyS31` from the port list in the GUI.
 
 ## Testing with the DF1Emulator
 
@@ -68,21 +82,32 @@ sudo usermod -a -G dialout $USER
 
 ## File format
 
-The generated `.bin` file contains a raw DF1 memory snapshot with a small header:
+The generated `.bin` file contains a raw DF1 memory snapshot with a comprehensive header and integrity checks:
 
-| Offset | Content                       |
-|--------|-------------------------------|
-| 0      | Magic number `0xDF1A`         |
-| 2      | Version (currently `1`)       |
-| 3      | Number of files (int32)       |
-| 7      | For each file:                |
-|        | - File number (int32)         |
-|        | - File type (int32)           |
-|        | - Number of bytes (int32)     |
-|        | - Data length (int32)         |
-|        | - Raw data                    |
+| Offset | Content                                       |
+|--------|-----------------------------------------------|
+| 0      | Magic number `0xDF1A`                         |
+| 2      | Version (current `1`)                         |
+| 3      | Processor type (int32)                        |
+| 7      | Series/revision (byte)                        |
+| 8      | RAM size in KB (byte)                         |
+| 9      | Family tag (8 bytes, ASCII, e.g. "SLC    ")   |
+| 17     | Bulletin length (int32)                       |
+| 21     | Bulletin string (UTF‑8, e.g. "5/03")          |
+| 21+len | Timestamp (int64, UTC binary)                 |
+| 29+len | Number of files (int32)                       |
+| 33+len | For each file:                                |
+|        | - File number (int32)                         |
+|        | - File type (int32)                           |
+|        | - Number of bytes (int32)                     |
+|        | - Data length (int32)                         |
+|        | - Raw data                                    |
+| End    | CRC32 (uint32) of all preceding data          |
+| End+4  | SHA256 (32 bytes) of all preceding data       |
 
-This format is **not compatible** with `.RSS` files from RSLogix; it is intended only for exchange between DF1Comm‑based tools.
+This format is **not compatible** with `.RSS` files from RSLogix; it is intended only for exchange between DF1Comm‑based tools.  
+The file includes both CRC32 and SHA256 checksums to detect accidental corruption and intentional tampering.  
+During download, the tool validates the processor type and bulletin against the target PLC to prevent mismatched downloads.
 
 ## Troubleshooting
 
@@ -102,13 +127,14 @@ This format is **not compatible** with `.RSS` files from RSLogix; it is intended
 | `Views/MainWindow.axaml` | Main window XAML layout |
 | `ViewModels/MainWindowViewModel.cs` | MVVM logic for communication and transfer |
 | `Models/PlcInfo.cs` | PLC type information |
+| `Services/FrameDecoder.cs` | DF1 serial frame decoder for logging |
 | `Services/PlcIdentifier.cs` | Processor type detection |
 | `Services/ProgramTransferService.cs` | Upload/download and file serialisation |
+| `Utilities/Crs32.cs` | Small CRC32 helper (IEEE 802.3 polynomial 0xEDB88320) |
 
 ## License
 Same as the DF1Comm library (GPLv3+).
 
 ## Contributing
 - Fork, create a feature branch, and open a pull request.
-- Keep all comments in **English**.
 - Test with both the DF1Emulator and real hardware when possible.
