@@ -47,7 +47,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
     // ─── Observable collections ───────────────────────────────────────────────
     public ObservableCollection<string> AvailablePorts { get; } = new();
-    public ObservableCollection<int>    BaudRates      { get; } = new() { 9600, 19200, 38400 };
+    public ObservableCollection<int>    BaudRates      { get; } = new() { 2400, 4800, 9600, 19200, 38400, 57600, 115200 };
     public ObservableCollection<string> ParityOptions  { get; } = new() { "None", "Even", "Odd" };
     public ObservableCollection<string> ChecksumOptions { get; } = new() { "Crc", "Bcc" };
 
@@ -163,8 +163,9 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         RefreshPortsCommand = ReactiveCommand.Create(RefreshPorts, notBusy);
         ConnectCommand      = ReactiveCommand.CreateFromTask(ConnectAsync, canConnect);
-        DisconnectCommand   = ReactiveCommand.Create(Disconnect,
-                                  this.WhenAnyValue(x => x.IsConnected));
+        DisconnectCommand = ReactiveCommand.Create(Disconnect,
+                        this.WhenAnyValue(x => x.IsConnected, x => x.IsBusy,
+                            (connected, busy) => connected && !busy));
         UploadCommand       = ReactiveCommand.CreateFromTask(UploadAsync,   canUpload);
         DownloadCommand     = ReactiveCommand.CreateFromTask(DownloadAsync, canDownload);
         ClearLogCommand     = ReactiveCommand.Create(ClearLog);
@@ -204,13 +205,14 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
                 _logBuffer.Append(new string(' ', timeStamp.Length + 2));
                 _logBuffer.Append(secondLine);
                 _logBuffer.AppendLine();
+                _logLineCount += 2;
             }
             else
             {
                 _logBuffer.AppendLine(line);
+                _logLineCount++;
             }
 
-            _logLineCount++;
             LogText = _logBuffer.ToString();
         });
     }
@@ -274,8 +276,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
             if (plcInfo.SupportsUploadDownload)
             {
-                int mode = await Task.Run(() => _df1.GetRunMode());
-                string modeStr = mode == 1 ? "RUN" : "PROG";
+                // Mode already read from diagnostic status in PlcIdentifier
+                string modeStr = plcInfo.ModeStr;
                 StatusText = $"Connected | {plcInfo.Name} (0x{plcInfo.ProcessorType:X2}) | {modeStr}";
                 AppendLog($"Mode: {modeStr}");
             }
@@ -321,11 +323,18 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         if (_df1 == null) return;
         try
         {
-            // Re-read processor type mode           
-            int mode = await Task.Run(() => _df1.GetRunMode());
-            string modeStr = mode == 1 ? "RUN" : "PROG";
-            string name = _currentPlcInfo.Name;
-            StatusText = $"Connected | {name} | {modeStr}";
+            byte[]? data = await Task.Run(() => _df1.GetDiagnosticStatusRaw());
+            if (data != null && data.Length > 18)
+            {
+                byte modeByte = data[18];
+                string modeStr = (modeByte == 0x06 || modeByte == 0x1E) ? "RUN" : "PROG";
+                _currentPlcInfo = _currentPlcInfo with { ModeStr = modeStr };
+                StatusText = $"Connected | {_currentPlcInfo.Name} | {modeStr}";
+            }
+            else
+            {
+                AppendLog("Failed to refresh PLC status: invalid diagnostic data");
+            }
         }
         catch (Exception ex)
         {
@@ -364,7 +373,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
-            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct);
+            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
             await svc.UploadToFileAsync(saveFile.Path.LocalPath);
         }, "Upload");
     }
@@ -399,10 +408,14 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             "This will overwrite the PLC program with the file contents.\nContinue?");
         if (!confirmed) return;
 
+        // Get target PLC info
+        int targetProc = _currentPlcInfo.ProcessorType;
+        string targetBulletin = _currentPlcInfo.Bulletin;
+
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
             var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct);
-            await svc.DownloadFromFileAsync(filePath);
+            await svc.DownloadFromFileAsync(filePath, targetProc, targetBulletin);
         }, "Download");
     }
 
@@ -416,7 +429,10 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         ProgressMessage = string.Empty;
         AppendLog($"--- {operationName} started ---");
 
-        _cts = new CancellationTokenSource();
+        var cts = new CancellationTokenSource();
+        var prevCts = Interlocked.Exchange(ref _cts, cts);
+        prevCts?.Cancel();
+        prevCts?.Dispose();
 
         var progressMsg = new Progress<string>(msg =>
         {
@@ -448,8 +464,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             IsBusy          = false;
             ProgressValue   = 0;
             ProgressMessage = string.Empty;
-            _cts?.Dispose();
-            _cts = null;
+            var doneCts = Interlocked.Exchange(ref _cts, null);
+            doneCts?.Dispose();
         }
     }
 

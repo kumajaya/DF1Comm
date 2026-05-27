@@ -25,9 +25,32 @@ public record PlcInfo(
             "PLC5"       => "PLC5",
             _            => "PLC"
         };
-        string bulletinTag = string.IsNullOrWhiteSpace(Bulletin) ? "unknown" : Bulletin.Replace(' ', '_');
+
+        string bulletinTag = string.IsNullOrWhiteSpace(Bulletin)
+            ? "unknown"
+            : SanitizeSegment(Bulletin);
+
+        string safeMode = SanitizeSegment(modeStr);
         string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
 
-        return $"{familyTag}_{ProcessorType:X2}_{bulletinTag}_{modeStr}_{timestamp}.bin";
+        return $"{familyTag}_{ProcessorType:X2}_{bulletinTag}_{safeMode}_{timestamp}.bin";
+    }
+
+    /// <summary>
+    /// Replaces characters that are invalid in file names (on any platform)
+    /// with underscores, then trims leading/trailing underscores and whitespace.
+    /// </summary>
+    private static string SanitizeSegment(string input)
+    {
+        // Union of invalid chars across Windows, Linux, and macOS
+        char[] invalid = System.IO.Path.GetInvalidFileNameChars();
+
+        var sb = new System.Text.StringBuilder(input.Length);
+        foreach (char c in input)
+            sb.Append(Array.IndexOf(invalid, c) >= 0 || c == ' ' ? '_' : c);
+
+        // Collapse repeated underscores, e.g. "5__03" → "5_03"
+        string result = System.Text.RegularExpressions.Regex.Replace(sb.ToString(), "_+", "_");
+        return result.Trim('_');
     }
 }

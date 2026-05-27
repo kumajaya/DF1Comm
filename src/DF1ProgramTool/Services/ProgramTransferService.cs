@@ -1,8 +1,12 @@
 using System;
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using DF1ProgramTool.Utilities;
+using DF1ProgramTool.Models;
 using DF1Comm;
 
 namespace DF1ProgramTool.Services;
@@ -13,17 +17,20 @@ public class ProgramTransferService
     private readonly IProgress<string>? _progressMessage;
     private readonly IProgress<double>? _progressPercent;
     private readonly CancellationToken _cancellationToken;
+    private readonly PlcInfo? _plcInfo;
 
     public ProgramTransferService(
         global::DF1Comm.DF1Comm df1,
         IProgress<string>? message = null,
         IProgress<double>? percent = null,
-        CancellationToken cancellation = default)
+        CancellationToken cancellation = default,
+        PlcInfo? plcInfo = null)
     {
         _df1 = df1 ?? throw new ArgumentNullException(nameof(df1));
         _progressMessage = message;
         _progressPercent = percent;
         _cancellationToken = cancellation;
+        _plcInfo = plcInfo;
     }
 
     public async Task UploadToFileAsync(string filePath)
@@ -55,7 +62,16 @@ public class ProgramTransferService
 
                 _progressPercent?.Report(95);
                 _progressMessage?.Report($"Saving {files.Count} file(s) to disk…");
-                SaveToFile(filePath, files);
+
+                if (_plcInfo != null)
+                    SaveToFile(filePath, files,
+                        _plcInfo.ProcessorType,
+                        _plcInfo.Family,
+                        _plcInfo.SeriesRevision,
+                        _plcInfo.RamKb,
+                        _plcInfo.Bulletin);
+                else
+                    SaveToFile(filePath, files);
 
                 _progressPercent?.Report(100);
                 _progressMessage?.Report($"Upload complete – {files.Count} program file(s).");
@@ -67,14 +83,16 @@ public class ProgramTransferService
         }, _cancellationToken);
     }
 
-    public async Task DownloadFromFileAsync(string filePath)
+    public async Task DownloadFromFileAsync(string filePath, int targetProcessorType, string targetBulletin)
     {
         _cancellationToken.ThrowIfCancellationRequested();
 
         await Task.Run(() =>
         {
             _progressMessage?.Report("Reading program file from disk…");
-            var files = LoadFromFile(filePath);
+
+            // Validate against target PLC
+            var files = LoadFromFileAndValidate(filePath, targetProcessorType, targetBulletin, requireBulletinMatch: true);
 
             // DF1Comm.SetProgramMode() throws on failure; let the exception propagate
             _progressMessage?.Report("Setting PLC to Program mode…");
@@ -116,53 +134,84 @@ public class ProgramTransferService
 
     private static void SaveToFile(string path, Collection<PLCFileDetails> files)
     {
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-        using var bw = new BinaryWriter(fs);
-
-        // Header: magic + version for forward-compatibility
-        bw.Write((ushort)0xDF1A); // magic
-        bw.Write((byte)1);        // format version
-        bw.Write(files.Count);
-
-        foreach (var file in files)
-        {
-            bw.Write(file.FileNumber);
-            bw.Write(file.FileType);      // int32
-            bw.Write(file.NumberOfBytes);
-            bw.Write(file.Data.Length);
-            bw.Write(file.Data);
-        }
+        // Save with permissive defaults (no processor/bulletin check)
+        SaveToFile(path, files, processorType: 0, familyTag: "PLC", seriesRev: 0, ramKb: 0, bulletin: string.Empty);
     }
 
-    private static Collection<PLCFileDetails> LoadFromFile(string path)
+    private static void SaveToFile(string path, Collection<PLCFileDetails> files,
+        int processorType, string familyTag, byte seriesRev, byte ramKb, string bulletin)
+    {
+        using var ms = new MemoryStream();
+        using (var bw = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            bw.Write((ushort)0xDF1A);                 // magic
+            bw.Write((byte)1);                        // version (current = 1)
+            bw.Write(processorType);                  // int32
+            bw.Write(seriesRev);                      // byte
+            bw.Write(ramKb);                          // byte
+            var tagBytes = System.Text.Encoding.ASCII.GetBytes((familyTag ?? "PLC").PadRight(8).Substring(0,8));
+            bw.Write(tagBytes);                       // 8 bytes family tag
+            var bBytes = System.Text.Encoding.UTF8.GetBytes(bulletin ?? "");
+            bw.Write(bBytes.Length);
+            bw.Write(bBytes);
+            bw.Write(DateTime.UtcNow.ToBinary());     // timestamp
+            bw.Write(files.Count);
+
+            foreach (var file in files)
+            {
+                bw.Write(file.FileNumber);
+                bw.Write(file.FileType);
+                bw.Write(file.NumberOfBytes);
+                bw.Write(file.Data.Length);
+                bw.Write(file.Data);
+            }
+        }
+
+        byte[] content = ms.ToArray();
+        uint crc = Crc32.Compute(content);
+        byte[] sha;
+        using (var sha256 = SHA256.Create())
+            sha = sha256.ComputeHash(content);
+
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        fs.Write(content, 0, content.Length);
+        using var bw2 = new BinaryWriter(fs);
+        bw2.Write(crc);
+        bw2.Write(sha);
+    }
+
+    private static Collection<PLCFileDetails> LoadFromFileAndValidate(string path)
+    {
+        // Call the full validator with permissive defaults (no processor/bulletin check)
+        return LoadFromFileAndValidate(path, targetProcessorType: 0, targetBulletin: string.Empty, requireBulletinMatch: false);
+    }
+
+    private static Collection<PLCFileDetails> LoadFromFileAndValidate(
+        string path, int targetProcessorType, string targetBulletin, bool requireBulletinMatch = false)
     {
         if (!File.Exists(path))
             throw new FileNotFoundException($"Program file not found: {path}");
 
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        using var br = new BinaryReader(fs);
+        using var br = new BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
 
-        // Support both legacy (no header) and versioned files
-        // Peek at the first two bytes to detect the magic marker
         ushort magic = br.ReadUInt16();
-        int count;
-        bool versioned = magic == 0xDF1A;
-        if (versioned)
-        {
-            byte version = br.ReadByte(); // reserved for future use
-            _ = version;
-            count = br.ReadInt32();
-        }
-        else
-        {
-            // Legacy format: the first 4 bytes are a little-endian int32 count.
-            // Re-read: we already consumed 2 bytes, read the remaining 2.
-            ushort hi = br.ReadUInt16();
-            count = (int)((uint)hi << 16 | magic);
-        }
+        if (magic != 0xDF1A) throw new InvalidDataException("Not a DF1ProgramTool file (magic mismatch)");
+
+        byte version = br.ReadByte();
+        if (version != 1) throw new InvalidDataException($"Unsupported file version: {version} (expected 1)");
+
+        int procType = br.ReadInt32();
+        byte series = br.ReadByte();
+        byte ramKb = br.ReadByte();
+        string family = System.Text.Encoding.ASCII.GetString(br.ReadBytes(8)).Trim();
+        int bulletLen = br.ReadInt32();
+        string bulletin = bulletLen > 0 ? System.Text.Encoding.UTF8.GetString(br.ReadBytes(bulletLen)) : string.Empty;
+        long ts = br.ReadInt64();
+        int count = br.ReadInt32();
 
         if (count < 0 || count > 10_000)
-            throw new InvalidDataException($"Unexpected file count: {count}. File may be corrupt.");
+            throw new InvalidDataException($"Unexpected file count: {count}");
 
         var files = new Collection<PLCFileDetails>();
         for (int i = 0; i < count; i++)
@@ -170,7 +219,7 @@ public class ProgramTransferService
             var file = new PLCFileDetails
             {
                 FileNumber    = br.ReadInt32(),
-                FileType      = br.ReadInt32(),   // int32, not byte
+                FileType      = br.ReadInt32(),
                 NumberOfBytes = br.ReadInt32()
             };
             int dataLen = br.ReadInt32();
@@ -179,6 +228,30 @@ public class ProgramTransferService
             file.Data = br.ReadBytes(dataLen);
             files.Add(file);
         }
+
+        if (fs.Length < 36) throw new InvalidDataException("File too small to contain trailer");
+        fs.Seek(-36, SeekOrigin.End);
+        uint storedCrc = br.ReadUInt32();
+        byte[] storedSha = br.ReadBytes(32);
+
+        fs.Seek(0, SeekOrigin.Begin);
+        byte[] allExceptTrailer = new byte[fs.Length - 36];
+        int read = fs.Read(allExceptTrailer, 0, allExceptTrailer.Length);
+        if (read != allExceptTrailer.Length) throw new IOException("Failed to read file for checksum");
+
+        uint calcCrc = Crc32.Compute(allExceptTrailer);
+        if (calcCrc != storedCrc) throw new InvalidDataException("CRC mismatch: file may be corrupted");
+
+        using var sha256 = SHA256.Create();
+        var calcSha = sha256.ComputeHash(allExceptTrailer);
+        if (!calcSha.SequenceEqual(storedSha)) throw new InvalidDataException("SHA256 mismatch: file integrity check failed");
+
+        if (targetProcessorType != 0 && procType != targetProcessorType)
+            throw new InvalidDataException($"ProcessorType mismatch: file=0x{procType:X2} target=0x{targetProcessorType:X2}");
+
+        if (requireBulletinMatch && !string.Equals(bulletin, targetBulletin, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Bulletin mismatch: file='{bulletin}' target='{targetBulletin}'");
+
         return files;
     }
 }

@@ -7,6 +7,35 @@ namespace DF1ProgramTool.Services;
 
 public static class PlcIdentifier
 {
+
+    /// <summary>
+    /// Diagnostic Status response (CMD=0x06, FNC=0x03).
+    /// Response CMD = 0x46 (0x06 | 0x40), sent WITHOUT FUNC byte.
+    ///
+    /// Inner frame layout (WithoutFunc):
+    ///   [0]=DST [1]=SRC [2]=CMD [3]=STS [4]=TNS_LO [5]=TNS_HI [6]=DATA[0] ...
+    ///
+    /// DF1Comm reads ProcessorType from DataPackets[rTNS][9] = inner[9] = DATA[3].
+    /// payload[3] = 0x49 (SLC 5/03) → ProcessorType = 0x49.
+    ///
+    /// Payload layout per Publication 1770-6.5.16 Chapter 10 (1747-L532):
+    ///   Byte  0    : mode/status flags — bits 0-5 = 0, bit 6 = testing edits,
+    ///                bit 7 = edits in processor. NOT the mode code.
+    ///   Byte  1    : 0xEE — type extender
+    ///   Byte  2    : 0x34 — extended interface type (DF1 full-duplex, port 0)
+    ///   Byte  3    : 0x49 — extended processor type (1747-L534 rack, SLC 5/03)
+    ///   Byte  4    : series/revision
+    ///   Byte  5–15 : bulletin number "5/03" in ASCII, space-padded to 11 bytes
+    ///   Byte 16–17 : major error word (0x0000 = no fault)
+    ///   Byte 18    : processor mode status/control low byte — mode code bits 0-4
+    ///                  0x11 = local PROG   0x1E = local RUN
+    ///                  0x17 = TEST-cont    0x18 = TEST-single   0x19 = TEST-step
+    ///   Byte 19    : processor mode status/control high byte — fault flags
+    ///   Byte 20–21 : program ID
+    ///   Byte 22    : RAM size in Kbytes — 0x10 for 1747-L532E (32K)
+    ///   Byte 23    : flags (bits 2-7 = program owner node, 0x3F = no owner)
+    ///                bit 0 = directory file corrupted
+    /// </summary>
     public static async Task<PlcInfo> IdentifyAsync(global::DF1Comm.DF1Comm df1)
     {
         try
@@ -53,6 +82,8 @@ public static class PlcIdentifier
                         bulletin = Encoding.ASCII.GetString(data, bStart, bLen).Trim();
 
                     seriesRev = data.Length > 4 ? data[4] : (byte)0;
+                    byte mode = data.Length > 18 ? data[18] : (byte)0;
+                    modeStr = (mode == 0x06 || mode == 0x1E) ? "RUN" : "PROG";
                     ramKb = data.Length > 22 ? data[22] : (byte)0;
                 }
             }

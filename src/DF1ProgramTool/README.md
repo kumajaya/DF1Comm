@@ -3,6 +3,13 @@
 **Purpose**  
 Cross‑platform desktop GUI (Avalonia UI) that uploads the complete program from an Allen‑Bradley SLC or MicroLogix PLC to a binary file, and restores it back to a compatible controller. Designed as a lightweight, stand‑alone alternative for program backup and restore without RSLogix.
 
+> **⚠️ CAUTION – REAL PLC HAZARD**  
+> This tool performs **download** which overwrites the entire PLC program, including ladder logic and data tables.  
+> Running download on a **real PLC** will **erase the existing program** and replace it with the contents of the selected file.  
+> This may cause unexpected machine motion, loss of safety functions, or production downtime.  
+> **Only use this tool on a real PLC if you fully understand the consequences and have a verified backup.**  
+> For safe testing, use the [DF1Emulator](../DF1Emulator) first.
+
 ## Features
 - Automatic **PLC detection** – processor type, family, and run/program mode.
 - **Upload** – reads all program and data files, saves to a compact binary file (`.bin`) with a descriptive name.
@@ -11,6 +18,7 @@ Cross‑platform desktop GUI (Avalonia UI) that uploads the complete program fro
 - **Graphical COM port selection** – baud rate, parity, and node address configurable.
 - **Progress indication** – shows current file being transferred.
 - **Self‑contained** – uses only the DF1Comm library, no external UI dependencies.
+- **⚠️ Download overwrites PLC memory** – use with extreme caution on real hardware
 
 ## Requirements
 - .NET 8 SDK or later
@@ -84,6 +92,7 @@ This format is **not compatible** with `.RSS` files from RSLogix; it is intended
 | **Upload/Download buttons disabled** | PLC type is not supported (e.g. PLC‑5) or identification failed. |
 | **Invalid Address** during download | The selected binary file does not match the target PLC memory layout (different processor family). |
 | **Dialog hangs / no reaction** | Run from a terminal to see debug output; ensure the main window is not hidden. |
+| **PLC stopped working after download** | You downloaded a program file that is not compatible with your PLC. Restore the original backup using RSLogix or this tool if a correct backup exists. |
 
 ## Project structure
 | File | Description |
