@@ -259,6 +259,33 @@ namespace DF1Comm
             throw new DF1Exception("GetProcessorType: response packet too short or missing");
         }
 
+        /// <summary>
+        /// Sends Diagnostic Status (CMD=0x06, FNC=0x03) and returns the DATA[] payload (DATA[0]..).
+        /// Returns null if no response or on error (caller may throw or handle null).
+        /// This consolidates reading diagnostic payload so callers can parse bulletin, series, RAM, etc.
+        /// </summary>
+        public byte[]? GetDiagnosticStatusRaw()
+        {
+            byte[] data = Array.Empty<byte>();
+            int reply = PrefixAndSend(0x06, 0x03, data, true, out int rTNS);
+            if (reply != 0)
+                return null;
+
+            if (DataPackets.TryGetValue(rTNS, out byte[]? pkt) && pkt.Length > 6)
+            {
+                // pkt is the inner unstuffed frame: [DST SRC CMD STS TNS_LO TNS_HI DATA...]
+                // Return DATA[] starting at index 6
+                int dataLen = pkt.Length - 6;
+                if (dataLen <= 0) return Array.Empty<byte>();
+                var result = new byte[dataLen];
+                Array.Copy(pkt, 6, result, 0, dataLen);
+                return result;
+            }
+
+            return null;
+        }
+
+
         // ─── Read ─────────────────────────────────────────────────────────────────
         public string[] ReadAny(string startAddress, int numberOfElements)
         {

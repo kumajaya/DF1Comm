@@ -22,7 +22,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     // ─── Private state ────────────────────────────────────────────────────────
     private global::DF1Comm.DF1Comm? _df1;
     private CancellationTokenSource? _cts;
-    private PlcInfo _currentPlcInfo = new(0, "Unknown", false, "Unknown");
+    private PlcInfo _currentPlcInfo = new PlcInfo(0, "Unknown", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
+
     private bool _disposed;
 
     // Log buffer – capped at MaxLogLines
@@ -268,14 +269,14 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
             var plcInfo = await PlcIdentifier.IdentifyAsync(_df1);
             _currentPlcInfo = plcInfo;
-            AppendLog($"Identified: {plcInfo.Name} (0x{plcInfo.ProcessorType:X2})  " +
-                      $"Family={plcInfo.Family}  Upload/Download={plcInfo.SupportsUploadDownload}");
+            AppendLog($"Identified: {plcInfo.Name} (0x{plcInfo.ProcessorType:X2}) " +
+                      $"Upload/Download={plcInfo.SupportsUploadDownload}");
 
             if (plcInfo.SupportsUploadDownload)
             {
                 int mode = await Task.Run(() => _df1.GetRunMode());
                 string modeStr = mode == 1 ? "RUN" : "PROG";
-                StatusText = $"Connected | {plcInfo.Name} | {modeStr}";
+                StatusText = $"Connected | {plcInfo.Name} (0x{plcInfo.ProcessorType:X2}) | {modeStr}";
                 AppendLog($"Mode: {modeStr}");
             }
             else
@@ -305,7 +306,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     {
         AppendLog("Disconnecting…");
         DisposeDF1();
-        _currentPlcInfo = new(0, "Unknown", false, "Unknown");
+        _currentPlcInfo = new PlcInfo(0, "Unknown", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
         IsConnected     = false;
         StatusText      = "Disconnected";
         AppendLog("Disconnected.");
@@ -341,11 +342,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         var topLevel = GetMainWindow();
         if (topLevel == null) return;
 
-        string modeStr;
-        try   { modeStr = await Task.Run(() => _df1.GetRunMode()) == 1 ? "RUN" : "PROG"; }
-        catch { modeStr = "UNKNOWN"; }
-
-        string defaultFileName = _currentPlcInfo.GetDefaultFileName(modeStr);
+        // Prefer the mode already read at connect; fall back to a fresh diagnostic read if you want latest mode
+        string defaultFileName = _currentPlcInfo.GetDefaultFileName(_currentPlcInfo.ModeStr);
 
         var saveFile = await topLevel.StorageProvider.SaveFilePickerAsync(
             new Avalonia.Platform.Storage.FilePickerSaveOptions

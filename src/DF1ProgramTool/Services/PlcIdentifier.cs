@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Threading.Tasks;
 using DF1ProgramTool.Models;
 
@@ -10,6 +11,7 @@ public static class PlcIdentifier
     {
         try
         {
+            // Basic processor type
             int procType = await Task.Run(() => df1.GetProcessorType());
 
             (string name, string family) = procType switch
@@ -25,14 +27,46 @@ public static class PlcIdentifier
                 _    => ($"Unknown (0x{procType:X2})", "Unknown")
             };
 
-            // Upload/download only supported for SLC and MicroLogix families
-            bool supports = family is "SLC" or "MicroLogix";
+            // Defaults
+            string bulletin = string.Empty;
+            byte seriesRev = 0;
+            byte ramKb = 0;
+            string modeStr = "UNKNOWN";
 
-            return new PlcInfo(procType, name, supports, family);
+            // Read diagnostic DATA[] once
+            try
+            {
+                byte[]? data = await Task.Run(() => df1.GetDiagnosticStatusRaw());
+                if (data != null && data.Length >= 16)
+                {
+                    // Per emulator/spec: DATA[3] = ProcessorType (redundant), DATA[5..15] = bulletin ASCII (11 bytes)
+                    if (data.Length > 3)
+                    {
+                        // If DF1Comm GetProcessorType returned something different, keep procType from GetProcessorType()
+                        // but we can override if needed:
+                        // procType = data[3];
+                    }
+
+                    int bStart = 5;
+                    int bLen = Math.Min(11, data.Length - bStart);
+                    if (bLen > 0)
+                        bulletin = Encoding.ASCII.GetString(data, bStart, bLen).Trim();
+
+                    seriesRev = data.Length > 4 ? data[4] : (byte)0;
+                    ramKb = data.Length > 22 ? data[22] : (byte)0;
+                }
+            }
+            catch
+            {
+                // ignore if DF1Comm doesn't support raw diagnostic read
+            }
+
+            bool supports = family is "SLC" or "MicroLogix";
+            return new PlcInfo(procType, name, supports, family, bulletin, seriesRev, ramKb, modeStr);
         }
         catch (Exception ex)
         {
-            return new PlcInfo(0, $"Identify error: {ex.Message}", false, "Unknown");
+            return new PlcInfo(0, $"Identify error: {ex.Message}", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
         }
     }
 }
