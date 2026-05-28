@@ -112,6 +112,10 @@ sudo usermod -a -G dialout $USER
 - Use **19200 baud, No parity, 8 data bits, 1 stop bit** (or match the emulator settings).
 - If RSLinx does not show the processor or memory, check the emulator console for hex logs and ensure `PlcMemory` file offsets match RSLinx expectations.
 
+![RSLinx](Assets/Screenshots/RSLinx.png)
+
+*RSLinx OPC Server accessing DF1Emulator memory in the background*
+
 ## Project structure
 | File | Description |
 |------|-------------|

@@ -21,6 +21,10 @@ Enhanced DF1 client for testing `DF1Comm` against a real PLC or the DF1Emulator.
 - **Stress test mode** – continuous read loop with configurable iteration count
 - Configurable serial settings (port, baud, parity, node IDs, checksum)
 
+![Example client](Assets/Screenshots/Example.png)
+
+*Example client stress test on DF1Emulator*
+
 ## Requirements
 - .NET 8 SDK or later
 - `DF1Comm` library (referenced via project or DLL)

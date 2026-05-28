@@ -20,6 +20,12 @@ Cross‑platform desktop GUI (Avalonia UI) that uploads the complete program fro
 - **Self‑contained** – uses only the DF1Comm library, no external UI dependencies.
 - **⚠️ Download overwrites PLC memory** – use with extreme caution on real hardware
 
+## Screenshots
+
+![Main Window](Assets/Screenshots/MainWindow.png)
+
+*Main window after uploading DF1Emulator internal memory*
+
 ## Requirements
 - .NET 8 SDK or later
 - Windows / Linux / macOS (serial port support required)
