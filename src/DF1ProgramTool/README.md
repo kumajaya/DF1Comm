@@ -136,7 +136,7 @@ During download, the tool validates the processor type and bulletin against the 
 | `Services/FrameDecoder.cs` | DF1 serial frame decoder for logging |
 | `Services/PlcIdentifier.cs` | Processor type detection |
 | `Services/ProgramTransferService.cs` | Upload/download and file serialisation |
-| `Utilities/Crs32.cs` | Small CRC32 helper (IEEE 802.3 polynomial 0xEDB88320) |
+| `Utilities/Crc32.cs` | Small CRC32 helper (IEEE 802.3 polynomial 0xEDB88320) |
 
 ## License
 Same as the DF1Comm library (GPLv3+).

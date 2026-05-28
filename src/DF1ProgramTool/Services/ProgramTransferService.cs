@@ -230,7 +230,10 @@ public class ProgramTransferService
             files.Add(file);
         }
 
-        if (fs.Length < 36) throw new InvalidDataException("File too small to contain trailer");
+        const int MinFileSize = 69; // header minimum + trailer (CRC32 + SHA256)
+        if (fs.Length < MinFileSize)
+            throw new InvalidDataException(
+                $"File too small to be valid (size={fs.Length}, minimum={MinFileSize})");
         fs.Seek(-36, SeekOrigin.End);
         uint storedCrc = br.ReadUInt32();
         byte[] storedSha = br.ReadBytes(32);

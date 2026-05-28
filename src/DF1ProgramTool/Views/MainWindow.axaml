@@ -101,18 +101,18 @@
                                 Background="#2E7D32"
                                 Foreground="White"
                                 BorderThickness="0" />
-                        <Button Content="Download  (File → PLC)"
-                                Command="{Binding DownloadCommand}"
-                                IsEnabled="{Binding CanDownload}"
-                                Width="170"
-                                Background="#C62828"
-                                Foreground="White"
-                                BorderThickness="0" />
                         <Button Content="Compare"
                                 Command="{Binding CompareCommand}"
                                 IsEnabled="{Binding CanCompare}"
                                 Width="170"
                                 Background="#1565C0"
+                                Foreground="White"
+                                BorderThickness="0" />
+                        <Button Content="Download  (File → PLC)"
+                                Command="{Binding DownloadCommand}"
+                                IsEnabled="{Binding CanDownload}"
+                                Width="170"
+                                Background="#C62828"
                                 Foreground="White"
                                 BorderThickness="0" />
                     </StackPanel>

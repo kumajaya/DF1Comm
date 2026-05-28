@@ -59,6 +59,22 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     public ObservableCollection<string> ChecksumOptions { get; } = new() { "Crc", "Bcc" };
 
     // ─── Properties ───────────────────────────────────────────────────────────
+    public PlcInfo CurrentPlcInfo
+    {
+        get => _currentPlcInfo;
+        private set
+        {
+            if (!EqualityComparer<PlcInfo>.Default.Equals(_currentPlcInfo, value))
+            {
+                _currentPlcInfo = value;
+                this.RaisePropertyChanged(nameof(CurrentPlcInfo));
+                this.RaisePropertyChanged(nameof(CanUpload));
+                this.RaisePropertyChanged(nameof(CanDownload));
+                this.RaisePropertyChanged(nameof(CanCompare));
+            }
+        }
+    }
+
     public string SelectedPort
     {
         get => _selectedPort;
@@ -302,7 +318,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             AppendLog("Port opened.");
 
             var plcInfo = await PlcIdentifier.IdentifyAsync(_df1);
-            _currentPlcInfo = plcInfo;
+            CurrentPlcInfo = plcInfo;
             AppendLog($"Identified: {plcInfo.Name} (0x{plcInfo.ProcessorType:X2}) " +
                       $"Upload/Download={plcInfo.SupportsUploadDownload}");
 
@@ -340,7 +356,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     {
         AppendLog("Disconnecting…");
         DisposeDF1();
-        _currentPlcInfo = new PlcInfo(0, "Unknown", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
+        CurrentPlcInfo = new PlcInfo(0, "Unknown", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
         IsConnected     = false;
         StatusText      = "Disconnected";
         AppendLog("Disconnected.");
@@ -359,8 +375,8 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             if (data != null && data.Length > 18)
             {
                 byte modeByte = data[18];
-                string modeStr = (modeByte == 0x06 || modeByte == 0x1E) ? "RUN" : "PROG";
-                _currentPlcInfo = _currentPlcInfo with { ModeStr = modeStr };
+                string modeStr = PlcIdentifier.DecodeModeString(modeByte);
+                CurrentPlcInfo = CurrentPlcInfo with { ModeStr = modeStr };
                 StatusText = $"Connected | {_currentPlcInfo.Name} | {modeStr}";
             }
             else
@@ -446,7 +462,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
-            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct);
+            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
             await svc.DownloadFromFileAsync(filePath, targetProc, targetBulletin);
         }, "Download");
     }
@@ -574,7 +590,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
-            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct);
+            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
             var results = await svc.CompareFullAsync(filePath);
             await ShowCompareResultsAsync(results);
         }, "Compare");
@@ -585,14 +601,20 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     /// </summary>
     private async Task ShowCompareResultsAsync<T>(List<T> results) where T : StructureCompareResult
     {
-        if (!results.Any())
+        bool allMatch = results.Count > 0 && results.All(r =>
+            r.StructureMatch &&
+            (r is not FullCompareResult fc || fc.DataMatches));
+
+        if (allMatch)
         {
-            await ShowMessageAsync("Compare Result", "No differences found — files match.");
+            await ShowMessageAsync("Compare Result",
+                $"All {results.Count} file(s) match — no differences found.");
             return;
         }
 
         // Determine display mode before entering the UI thread dispatch
-        var isFullCompare = results.Any(x => x is FullCompareResult);
+        int mismatchCount = results.Count(r =>
+            !r.StructureMatch || (r is FullCompareResult fc && !fc.DataMatches));
 
         // ShowDialog must be called on the UI thread; RunTransferAsync resumes
         // on a thread-pool thread, so we marshal explicitly here.
@@ -600,7 +622,9 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         {
             var window = new Window
             {
-                Title  = isFullCompare ? "Full Compare Results" : "Structure Compare Results",
+                Title  = results.Any(x => x is FullCompareResult)
+                    ? $"Full Compare Results — {mismatchCount} mismatch(es)"
+                    : $"Structure Compare Results — {mismatchCount} mismatch(es)",
                 Width  = 800,
                 Height = 600,
                 // SizeToContent.Manual is required so the window respects the
@@ -632,8 +656,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             dataGrid.Columns.Add(new DataGridTextColumn { Header = "Structure",           Binding = new Binding("StructureStatus"),Width = new DataGridLength(100)});
 
             // Data column — only shown for full compare results
-            if (isFullCompare)
-                dataGrid.Columns.Add(new DataGridTextColumn { Header = "Data", Binding = new Binding("DataStatus"), Width = new DataGridLength(250) });
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Data", Binding = new Binding("DataStatus"), Width = new DataGridLength(250) });
 
             // Color each row green (match) or pink (mismatch) as it loads.
             // LoadingRow fires on the UI thread per row, making it the safest

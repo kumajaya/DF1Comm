@@ -49,7 +49,8 @@ public static class FrameDecoder
         int dst = unstuffed[0], src = unstuffed[1], cmd = unstuffed[2], sts = unstuffed[3];
         int tns = unstuffed[4] | (unstuffed[5] << 8);
         int fnc = unstuffed.Length >= 7 ? unstuffed[6] : 0;
-        byte[] data = unstuffed.Length > 7 ? unstuffed.Skip(7).ToArray() : Array.Empty<byte>();
+        byte[] data = unstuffed.Length >= 8 ? unstuffed.Skip(7).ToArray() : Array.Empty<byte>();
+        // Note: Length == 7 means there is an FNC but no data — valid for some response frames
 
         var sb = new StringBuilder();
         sb.AppendLine($"DST={dst} SRC={src} TNS={tns} CMD=0x{cmd:X2} FNC=0x{fnc:X2} STS={sts}");

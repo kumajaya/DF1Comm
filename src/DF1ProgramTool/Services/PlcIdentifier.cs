@@ -83,7 +83,7 @@ public static class PlcIdentifier
 
                     seriesRev = data.Length > 4 ? data[4] : (byte)0;
                     byte mode = data.Length > 18 ? data[18] : (byte)0;
-                    modeStr = (mode == 0x06 || mode == 0x1E) ? "RUN" : "PROG";
+                    modeStr = DecodeModeString(mode);
                     ramKb = data.Length > 22 ? data[22] : (byte)0;
                 }
             }
@@ -100,4 +100,15 @@ public static class PlcIdentifier
             return new PlcInfo(0, $"Identify error: {ex.Message}", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
         }
     }
+
+    public static string DecodeModeString(byte modeByte) => modeByte switch
+    {
+        0x1E => "RUN",   // local RUN  (pub. 1770-6.5.16 §10)
+        0x06 => "RUN",   // remote RUN (observed on SLC 5/03, not documented in pub)
+        0x11 => "PROG",  // local PROG
+        0x17 => "TEST",  // TEST-continuous
+        0x18 => "TEST",  // TEST-single step
+        0x19 => "TEST",  // TEST-step
+        _    => "PROG"   // default safe assumption
+    };
 }
