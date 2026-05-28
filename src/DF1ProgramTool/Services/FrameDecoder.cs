@@ -27,6 +27,21 @@ public static class FrameDecoder
         return list.ToArray();
     }
 
+    /// <summary>
+    /// Returns bytes per element for SLC 500 file types.
+    /// Defaults to 2 (word) for unknown types.
+    /// </summary>
+    private static int GetBytesPerElement(int fileType)
+    {
+        return fileType switch
+        {
+            0x86 or 0x87 or 0x88 => 6, // Timer, Counter, Control
+            0x8A => 4,                 // Float
+            0x8D => 84,                // String
+            _ => 2                     // Word (Integer, Binary, Status, I/O)
+        };
+    }
+
     public static string Decode(byte[] raw)
     {
         if (raw.Length == 2 && raw[0] == 0x10)
@@ -53,7 +68,7 @@ public static class FrameDecoder
         var sb = new StringBuilder();
         sb.AppendLine($"DST={dst} SRC={src} TNS={tns} CMD=0x{cmd:X2} FNC=0x{fnc:X2} STS={sts}");
 
-        if (cmd == 0x0F && (fnc == 0xA1 || fnc == 0xA2 || fnc == 0xAA || fnc == 0xAB) && data.Length >= 3)
+        if (cmd == 0x0F && (fnc == 0xA1 || fnc == 0xA2 || fnc == 0xAA || fnc == 0xAB) && data.Length >= 4)
         {
             int size = data[0], fileNum = data[1], fileType = data[2];
             string typeStr = fileType switch
@@ -64,11 +79,18 @@ public static class FrameDecoder
             };
             int elem = data[3], idx = 4;
             if (elem == 0xFF && data.Length >= idx+2) { elem = data[idx] | (data[idx+1] << 8); idx += 2; }
-            sb.AppendLine($"              Size={size}, File={fileNum}, Type={typeStr}, Element={elem}");
+
+            // size is the number of bytes requested in this transaction — not the total file size.
+            // For large files (e.g. T4=468 bytes) DF1Comm splits into multiple transactions
+            // (max 236 bytes each), so size/bpe reflects only this transaction's portion.
+            int bpe = GetBytesPerElement(fileType);
+            int wordsRequested = size / bpe;
+            sb.Append($"              Size={size} bytes ({wordsRequested} {(bpe == 2 ? "words" : "elements")}), File={fileNum}, Type={typeStr}, Element={elem}");
             if ((fnc == 0xA2 || fnc == 0xAB) && data.Length > idx)
-                sb.AppendLine($"              SubElem={data[idx]}");
+                sb.Append($", SubElem={data[idx]}");
             if (fnc == 0xAB && data.Length >= idx+4)
-                sb.AppendLine($"              Mask=0x{(data[idx] | (data[idx+1] << 8)):X4}");
+                sb.Append($", Mask=0x{(data[idx] | (data[idx+1] << 8)):X4}");
+            sb.AppendLine();
         }
         else if (cmd == 0x06 && fnc == 0x03)
             sb.AppendLine("              (Diagnostic status data)");

@@ -38,13 +38,13 @@ using System.Collections.Generic;
 /// SLC 5/03 constraints (based on typical memory map):
 ///   - Total user memory : 14K words maximum
 ///   - I/O capacity      : depends on chassis size (here we emulate a moderate setup)
-///   - Status file       : S:0 – S:83 (84 words, but we only allocate 83 words 0‑based)
+///   - Status file       : S:0 – S:82 (83 words = 166 bytes)
 ///   - Supports B, N, T, C, R, F, and additional B/N files beyond the basic set
 ///
 /// Data table file numbers:
-///   0 = O0  (Output,  type 0x8B, 2 elems, 6 words  = 12 bytes) ← real PLC: Elems=2, Words=6
-///   1 = I1  (Input,   type 0x8C, 7 elems, 21 words = 42 bytes) ← real PLC: Elems=7, Words=21
-///   2 = S2  (Status,  type 0x84, 84 words  = 168 bytes, S:0–S:83)
+///   0 = O0  (Output,  type 0x8B, 2 elems  =   4 bytes) ← O4:0, O5:0 (slots 4,5)
+///   1 = I1  (Input,   type 0x8C, 7 elems  =  14 bytes) ← slots 1,2,3 + NI4×4
+///   2 = S2  (Status,  type 0x84, 83 words = 166 bytes, S:0–S:82)
 ///   3 = B3  (Binary,  type 0x85, 14 words  = 28 bytes)
 ///   4 = T4  (Timer,   type 0x86, 78 elem   = 468 bytes, 6 bytes/elem)
 ///   5 = C5  (Counter, type 0x87, 1 elem    = 6 bytes)
@@ -121,9 +121,9 @@ public class PlcMemory
 
         // ========== DATA FILES (file numbers 0..31) ==========
         // Write all data files first, in order of file number.
-        Reg(file0, pos, 0x8B, 12, 0, 2); pos += 10;  // O0 — 2 elems, 6 words = 12 bytes
-        Reg(file0, pos, 0x8C, 42, 1, 2); pos += 10;  // I1 — 7 elems, 21 words = 42 bytes
-        Reg(file0, pos, 0x84, 168, 2, 2); pos += 10; // S2
+        Reg(file0, pos, 0x8B,   4, 0, 2); pos += 10;  // O0 — 2 elems = 4 bytes  (O4:0, O5:0)
+        Reg(file0, pos, 0x8C,  14, 1, 2); pos += 10;  // I1 — 7 elems = 14 bytes (slots 1,2,3 + NI4×4)
+        Reg(file0, pos, 0x84, 166, 2, 2); pos += 10;  // S2 — 83 words = 166 bytes (S:0–S:82)
         Reg(file0, pos, 0x85, 28, 3, 2); pos += 10;  // B3
         Reg(file0, pos, 0x86, 468, 4, 6); pos += 10; // T4
         Reg(file0, pos, 0x87, 6, 5, 6); pos += 10;   // C5
@@ -210,25 +210,25 @@ public class PlcMemory
         // Store the directory file itself
         _files[(1, 0)] = file0;
 
-        // ── O0 — Output (file 0, 2 elems, 6 words = 12 bytes) ──────────────────
-        // Real PLC: Elems=2, Words=6. Each element = 3 words (6 bytes).
-        _files[(0x8B, 0)] = new byte[12];
+        // ── O0 — Output (file 0, 2 elems = 4 bytes) ────────────────────────────
+        // Real PLC: O4:0/0..15 (slot 4, OB16) and O5:0/0..15 (slot 5, OB16).
+        // O0 is compacted — only active output words, no slot-index padding.
+        // Word 0 = slot 4 output image, Word 1 = slot 5 output image.
+        _files[(0x8B, 0)] = new byte[4];
         _bytesPerElement[(0x8B, 0)] = 2;
-        WriteU16(_files[(0x8B, 0)], 0, 0x0201);
-        WriteU16(_files[(0x8B, 0)], 2, 0x0403);
-        WriteU16(_files[(0x8B, 0)], 4, 0x0605);
-        WriteU16(_files[(0x8B, 0)], 6, 0x0807);
-        WriteU16(_files[(0x8B, 0)], 8, 0x0A09);
-        WriteU16(_files[(0x8B, 0)], 10, 0x0C0B);
+        WriteU16(_files[(0x8B, 0)], 0, 0x0000);  // O4:0 (slot 4)
+        WriteU16(_files[(0x8B, 0)], 2, 0x0000);  // O5:0 (slot 5)
 
-        // ── I1 — Input (file 1, 7 elems, 21 words = 42 bytes) ──────────────────
-        // Real PLC: Elems=7, Words=21. Each element = 3 words (6 bytes).
-        _files[(0x8C, 1)] = new byte[42];
+        // ── I1 — Input (file 1, 7 elems = 14 bytes) ────────────────────────────
+        // Real PLC: I1:0 (slot 1), I2:0 (slot 2), I3:0 (slot 3) = 3 × 2 bytes,
+        //           I6:0..I6:3 (slot 6, NI4, 4-ch analog) = 4 × 2 bytes.
+        // Total: 7 words = 14 bytes. Compacted, no padding for slots 4 and 5.
+        _files[(0x8C, 1)] = new byte[14];
         _bytesPerElement[(0x8C, 1)] = 2;
 
-        // ── S2 — Status (file 2, 84 words = S:0–S:83) ────────────────────────
+        // ── S2 — Status (file 2, 83 words = S:0–S:82 = 166 bytes) ───────────────
         // Values initialised from the supplied hex dump (little-endian words).
-        _files[(0x84, 2)] = new byte[168];
+        _files[(0x84, 2)] = new byte[166];
         _bytesPerElement[(0x84, 2)] = 2;
 
         ushort[] s2vals = new ushort[]
@@ -249,8 +249,8 @@ public class PlcMemory
             0x0214, 0x0004, 0x0008, 0x0001, 0x005F, 0x0010, 0x01E0, 0x0006, 0x0000, 0x0000,
             // S2:70 .. S2:79
             0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-            // S2:80 .. S2:83
-            0x0000, 0x0000, 0x0000, 0x0000
+            // S2:80 .. S2:82
+            0x0000, 0x0000, 0x0000
         };
         for (int i = 0; i < s2vals.Length; i++)
             WriteU16(_files[(0x84, 2)], i * 2, s2vals[i]);
@@ -315,7 +315,8 @@ public class PlcMemory
         //   Slot 3: 1746-IB16  — 16-ch digital input  (SINK 24VDC),  2 InputBytes
         //   Slot 4: 1746-OB16  — 16-ch digital output (TRANS-SRC),   2 OutputBytes
         //   Slot 5: 1746-OB16  — 16-ch digital output (TRANS-SRC),   2 OutputBytes
-        //   Slot 6: 1746-NI4   — 4-ch analog input,   8 InputBytes + 2 OutputBytes
+        //   Slot 6: 1746-NI4   — 4-ch analog input,   8 InputBytes, 0 OutputBytes
+        //                         (NI4 is input-only; no output word in O0)
         //
         // Raw slot count = 8 → GetSlotCount() returns 7 → IOConfig[8] (i = 0..7).
         // Minimum buffer = 4 + 8*6 + 2 = 54 bytes; padded to 64.
@@ -340,9 +341,9 @@ public class PlcMemory
         // Slot 5 — 1746-OB16, 16-ch digital output
         ioConfig[5 * 6 + 4 + 2] = 2;               // OutputBytes = 2
 
-        // Slot 6 — 1746-NI4, 4-ch analog input (4 × 16-bit words) + 1 control word
+        // Slot 6 — 1746-NI4, 4-ch analog input (4 × 16-bit words), input-only
         ioConfig[6 * 6 + 4 + 0] = 8;               // InputBytes  = 8 (4 channels × 2 bytes)
-        ioConfig[6 * 6 + 4 + 2] = 2;               // OutputBytes = 2 (control word)
+        // OutputBytes = 0 (NI4 has no output word)
 
         // CardCode fields left as 0x0000 for all slots (not required for emulation)
 
