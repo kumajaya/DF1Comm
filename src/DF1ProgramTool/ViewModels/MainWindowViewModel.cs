@@ -12,11 +12,9 @@ using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
-using Avalonia.Controls.Primitives;
 using Avalonia.Data;
 using Avalonia.Layout;
 using Avalonia.Media;
-using Avalonia.Styling;
 using DF1Comm;
 using DF1ProgramTool.Models;
 using DF1ProgramTool.Services;
@@ -30,7 +28,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     private global::DF1Comm.DF1Comm? _df1;
     private CancellationTokenSource? _cts;
     private PlcInfo _currentPlcInfo = new PlcInfo(0, "Unknown", false, "Unknown", string.Empty, 0, 0, "UNKNOWN");
-
+    private readonly IDialogService _dialogService;
     private bool _disposed;
 
     // Log buffer – capped at MaxLogLines
@@ -180,8 +178,10 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     private void OnRawFrameReceived(object? sender, byte[] frame) => AppendLog($"RX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
 
     // ─── Constructor ─────────────────────────────────────────────────────────
-    public MainWindowViewModel()
+    public MainWindowViewModel(IDialogService? dialogService = null)
     {
+        _dialogService = dialogService ?? new AvaloniaDialogService();
+
         var notBusy     = this.WhenAnyValue(x => x.IsBusy).Select(b => !b);
         var canConnect  = this.WhenAnyValue(x => x.IsBusy, x => x.IsConnected,
                               (busy, connected) => !busy && !connected);
@@ -287,7 +287,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     {
         if (string.IsNullOrEmpty(SelectedPort))
         {
-            await ShowMessageAsync("Error", "Select a COM port first.");
+            await _dialogService.ShowMessageAsync("Error", "Select a COM port first.");
             return;
         }
 
@@ -344,7 +344,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             AppendLog($"ERROR: {ex.Message}");
             DisposeDF1();
             StatusText = "Connection failed";
-            await ShowMessageAsync("Connection Error", ex.Message);
+            await _dialogService.ShowMessageAsync("Connection Error", ex.Message);
         }
         finally
         {
@@ -396,33 +396,14 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     {
         if (_df1 == null) return;
 
-        var topLevel = GetMainWindow();
-        if (topLevel == null) return;
-
-        // Prefer the mode already read at connect; fall back to a fresh diagnostic read if you want latest mode
         string defaultFileName = _currentPlcInfo.GetDefaultFileName(_currentPlcInfo.ModeStr);
-
-        var saveFile = await topLevel.StorageProvider.SaveFilePickerAsync(
-            new Avalonia.Platform.Storage.FilePickerSaveOptions
-            {
-                Title             = "Save PLC Program",
-                SuggestedFileName = defaultFileName,
-                DefaultExtension  = "bin",
-                FileTypeChoices   = new[]
-                {
-                    new Avalonia.Platform.Storage.FilePickerFileType("Binary file")
-                        { Patterns = new[] { "*.bin" } },
-                    new Avalonia.Platform.Storage.FilePickerFileType("All files")
-                        { Patterns = new[] { "*.*" } }
-                }
-            });
-
-        if (saveFile == null) return;
+        string? filePath = await _dialogService.SaveFilePickerAsync("Save PLC Program", defaultFileName);
+        if (filePath == null) return;
 
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
             var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
-            await svc.UploadToFileAsync(saveFile.Path.LocalPath);
+            await svc.UploadToFileAsync(filePath);
         }, "Upload");
     }
 
@@ -431,32 +412,14 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     {
         if (_df1 == null) return;
 
-        var topLevel = GetMainWindow();
-        if (topLevel == null) return;
+        string? filePath = await _dialogService.OpenFilePickerAsync("Select PLC Program File");
+        if (filePath == null) return;
 
-        var openFiles = await topLevel.StorageProvider.OpenFilePickerAsync(
-            new Avalonia.Platform.Storage.FilePickerOpenOptions
-            {
-                Title          = "Select PLC Program File",
-                AllowMultiple  = false,
-                FileTypeFilter = new[]
-                {
-                    new Avalonia.Platform.Storage.FilePickerFileType("Binary file")
-                        { Patterns = new[] { "*.bin" } },
-                    new Avalonia.Platform.Storage.FilePickerFileType("All files")
-                        { Patterns = new[] { "*.*" } }
-                }
-            });
-
-        if (openFiles == null || openFiles.Count == 0) return;
-        string filePath = openFiles[0].Path.LocalPath;
-
-        bool confirmed = await ShowConfirmAsync(
+        bool confirmed = await _dialogService.ShowConfirmAsync(
             "Confirm Download",
             "This will overwrite the PLC program with the file contents.\nContinue?");
         if (!confirmed) return;
 
-        // Get target PLC info
         int targetProc = _currentPlcInfo.ProcessorType;
         string targetBulletin = _currentPlcInfo.Bulletin;
 
@@ -465,6 +428,22 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
             await svc.DownloadFromFileAsync(filePath, targetProc, targetBulletin);
         }, "Download");
+    }
+
+    // ─── Compare ─────────────────────────────────────────────────────────────
+    private async Task CompareAsync()
+    {
+        if (_df1 == null) return;
+
+        string? filePath = await _dialogService.OpenFilePickerAsync("Select backup file to compare");
+        if (filePath == null) return;
+
+        await RunTransferAsync(async (progressMsg, progressPct, ct) =>
+        {
+            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
+            var results = await svc.CompareFullAsync(filePath);
+            await _dialogService.ShowCompareResultsAsync(results);
+        }, "Compare");
     }
 
     // ─── Shared transfer runner ───────────────────────────────────────────────
@@ -494,18 +473,18 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             await work(progressMsg, progressPct, _cts.Token);
             AppendLog($"--- {operationName} complete ---");
             await RefreshPlcStatusAsync();
-            await ShowMessageAsync($"{operationName} Complete",
+            await _dialogService.ShowMessageAsync($"{operationName} Complete",
                 $"{operationName} finished successfully.");
         }
         catch (OperationCanceledException)
         {
             AppendLog($"--- {operationName} cancelled ---");
-            await ShowMessageAsync("Cancelled", $"{operationName} was cancelled.");
+            await _dialogService.ShowMessageAsync("Cancelled", $"{operationName} was cancelled.");
         }
         catch (Exception ex)
         {
             AppendLog($"ERROR: {ex.Message}");
-            await ShowMessageAsync($"{operationName} Error", ex.Message);
+            await _dialogService.ShowMessageAsync($"{operationName} Error", ex.Message);
         }
         finally
         {
@@ -517,219 +496,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         }
     }
 
-    // ─── Dialog helpers ───────────────────────────────────────────────────────
-    private static async Task ShowMessageAsync(string title, string message)
-    {
-        var tcs      = new TaskCompletionSource();
-        var okButton = new Button { Content = "OK", Width = 80,
-            HorizontalAlignment = HorizontalAlignment.Center };
-        var dialog   = BuildDialog(title, message, okButton);
-        okButton.Click += (_, _) => dialog.Close();
-        dialog.Closed  += (_, _) => tcs.TrySetResult();
-        var owner = GetMainWindow();
-        if (owner != null) await dialog.ShowDialog(owner);
-        else               dialog.Show();
-        await tcs.Task;
-    }
-
-    private static async Task<bool> ShowConfirmAsync(string title, string message)
-    {
-        bool result   = false;   // default: No / dismissed
-        var yesButton = new Button { Content = "Yes", Width = 70 };
-        var noButton  = new Button { Content = "No",  Width = 70 };
-        var buttonRow = new StackPanel
-        {
-            Orientation         = Orientation.Horizontal,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Spacing             = 16,
-            Children            = { yesButton, noButton }
-        };
-        var dialog = BuildDialog(title, message, buttonRow);
-
-        // Buttons set the result then close.
-        // Closing via Alt+F4 / X leaves result = false (treat as cancel).
-        yesButton.Click += (_, _) => { result = true;  dialog.Close(); };
-        noButton .Click += (_, _) => { result = false; dialog.Close(); };
-
-        var owner = GetMainWindow();
-        if (owner != null) await dialog.ShowDialog(owner);
-        else               dialog.Show();
-
-        return result;
-    }
-
-    // ─── Compare ─────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Entry point for the Compare command. Prompts the user to select a backup
-    /// .bin file, asks whether to run a full (structure + data) or structure-only
-    /// comparison, then delegates to ProgramTransferService and shows the results.
-    /// </summary>
-    private async Task CompareAsync()
-    {
-        if (_df1 == null) return;
-
-        var topLevel = GetMainWindow();
-        if (topLevel == null) return;
-
-        // Let the user pick the backup file to compare against the live PLC
-        var files = await topLevel.StorageProvider.OpenFilePickerAsync(
-            new Avalonia.Platform.Storage.FilePickerOpenOptions
-            {
-                Title = "Select backup file to compare",
-                AllowMultiple = false,
-                FileTypeFilter = new[]
-                {
-                    new Avalonia.Platform.Storage.FilePickerFileType("Binary file") { Patterns = new[] { "*.bin" } },
-                    new Avalonia.Platform.Storage.FilePickerFileType("All files")   { Patterns = new[] { "*.*" } }
-                }
-            });
-
-        if (files == null || files.Count == 0) return;
-        string filePath = files[0].Path.LocalPath;
-
-        await RunTransferAsync(async (progressMsg, progressPct, ct) =>
-        {
-            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
-            var results = await svc.CompareFullAsync(filePath);
-            await ShowCompareResultsAsync(results);
-        }, "Compare");
-    }
-
-    /// <summary>
-    /// Displays comparison results in a modal DataGrid window.
-    /// </summary>
-    private async Task ShowCompareResultsAsync<T>(List<T> results) where T : StructureCompareResult
-    {
-        bool allMatch = results.Count > 0 && results.All(r =>
-            r.StructureMatch &&
-            (r is not FullCompareResult fc || fc.DataMatches));
-
-        if (allMatch)
-        {
-            await ShowMessageAsync("Compare Result",
-                $"All {results.Count} file(s) match — no differences found.");
-            return;
-        }
-
-        // Determine display mode before entering the UI thread dispatch
-        int mismatchCount = results.Count(r =>
-            !r.StructureMatch || (r is FullCompareResult fc && !fc.DataMatches));
-
-        // ShowDialog must be called on the UI thread; RunTransferAsync resumes
-        // on a thread-pool thread, so we marshal explicitly here.
-        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
-        {
-            var window = new Window
-            {
-                Title  = results.Any(x => x is FullCompareResult)
-                    ? $"Full Compare Results — {mismatchCount} mismatch(es)"
-                    : $"Structure Compare Results — {mismatchCount} mismatch(es)",
-                Width  = 800,
-                Height = 600,
-                // SizeToContent.Manual is required so the window respects the
-                // explicit Width/Height above and does not attempt to size itself
-                // to the DataGrid's initial (possibly zero) desired size.
-                SizeToContent         = SizeToContent.Manual,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner
-            };
-
-            // ── DataGrid ──────────────────────────────────────────────────────
-            var dataGrid = new DataGrid
-            {
-                AutoGenerateColumns      = false,
-                CanUserResizeColumns     = true,
-                Margin                   = new Thickness(10, 10, 10, 0),
-                ItemsSource              = results,
-                // Stretch is required so the DataGrid fills the Star row in the
-                // Grid layout below; without it the row collapses to zero height.
-                VerticalAlignment        = VerticalAlignment.Stretch,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                VerticalScrollBarVisibility   = ScrollBarVisibility.Auto
-            };
-
-            // Common columns — present for both structure-only and full compare
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "File",                Binding = new Binding("FileTypeName"),  Width = new DataGridLength(100) });
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "#",                   Binding = new Binding("FileNumber"),    Width = new DataGridLength(50)  });
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Backup (bytes)", Binding = new Binding("SizeDisplay"),   Width = new DataGridLength(120) });
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "PLC (bytes)",    Binding = new Binding("PlcSizeDisplay"),Width = new DataGridLength(120) });
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Structure",           Binding = new Binding("StructureStatus"),Width = new DataGridLength(100)});
-
-            // Data column — only shown for full compare results
-            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Data", Binding = new Binding("DataStatus"), Width = new DataGridLength(250) });
-
-            // Color each row green (match) or pink (mismatch) as it loads.
-            // LoadingRow fires on the UI thread per row, making it the safest
-            // place to set row background without touching the ControlTheme.
-            dataGrid.LoadingRow += (_, e) =>
-            {
-                if (e.Row.DataContext is StructureCompareResult r)
-                    e.Row.Background = r.StructureMatch
-                        ? new SolidColorBrush(Colors.LightGreen)
-                        : new SolidColorBrush(Colors.LightPink);
-            };
-
-            // ── Layout ────────────────────────────────────────────────────────
-            // Grid with two rows: DataGrid fills all available space (Star),
-            // Close button sits below it at its natural height (Auto).
-            var closeButton = new Button
-            {
-                Content             = "Close",
-                Width               = 80,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin              = new Thickness(10)
-            };
-            closeButton.Click += (_, _) => window.Close();
-
-            var grid = new Grid();
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Star));
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-
-            Grid.SetRow(dataGrid,     0);
-            Grid.SetRow(closeButton,  1);
-            grid.Children.Add(dataGrid);
-            grid.Children.Add(closeButton);
-
-            window.Content = grid;
-            await window.ShowDialog(GetMainWindow()!);
-        });
-    }
-
-    private static Window BuildDialog(string title, string message, Control actionControl) =>
-        new()
-        {
-            Title                 = title,
-            Width                 = 340,
-            SizeToContent         = SizeToContent.Height,
-            CanResize             = false,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Content               = new StackPanel
-            {
-                Margin  = new Avalonia.Thickness(20, 16),
-                Spacing = 16,
-                Children =
-                {
-                    new TextBlock
-                    {
-                        Text                = message,
-                        TextWrapping        = TextWrapping.Wrap,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        TextAlignment       = TextAlignment.Center
-                    },
-                    actionControl
-                }
-            }
-        };
-
     // ─── Helpers ─────────────────────────────────────────────────────────────
-    private static Window? GetMainWindow()
-    {
-        if (Avalonia.Application.Current?.ApplicationLifetime
-                is IClassicDesktopStyleApplicationLifetime desktop)
-            return desktop.MainWindow as Window;
-        return null;
-    }
-
     private void DisposeDF1()
     {
         if (_df1 == null) return;
