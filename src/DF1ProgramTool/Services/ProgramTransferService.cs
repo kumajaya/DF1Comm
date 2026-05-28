@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
@@ -253,5 +254,76 @@ public class ProgramTransferService
             throw new InvalidDataException($"Bulletin mismatch: file='{bulletin}' target='{targetBulletin}'");
 
         return files;
+    }
+
+    /// <summary>
+    /// Compares both structure and data (via CRC32) between a backup file and the PLC.
+    /// Only files that exist on both sides and have matching sizes are data-compared.
+    /// </summary>
+    /// <param name="filePath">Path to the .bin backup file</param>
+    /// <returns>List of full comparison results</returns>
+    public async Task<List<FullCompareResult>> CompareFullAsync(string filePath)
+    {
+        return await Task.Run(() =>
+        {
+            var fileFiles = LoadFromFileAndValidate(filePath, 0, "", false);
+            var plcFiles = _df1.UploadProgramData();
+
+            var comparer = EqualityComparer<PLCFileDetails>.Default;
+            var results = new List<FullCompareResult>();
+
+            foreach (var file in fileFiles)
+            {
+                var plcFile = plcFiles.FirstOrDefault(f => f.FileNumber == file.FileNumber && f.FileType == file.FileType);
+                bool existsInPlc = !comparer.Equals(plcFile, default);
+                bool sizeMatches = existsInPlc && plcFile.NumberOfBytes == file.NumberOfBytes;
+                uint? fileCrc = null, plcCrc = null;
+                bool dataMatches = false;
+
+                if (existsInPlc && sizeMatches)
+                {
+                    fileCrc = Crc32.Compute(file.Data);
+                    plcCrc = Crc32.Compute(plcFile.Data);
+                    dataMatches = (fileCrc == plcCrc);
+                }
+
+                results.Add(new FullCompareResult
+                {
+                    FileNumber = file.FileNumber,
+                    FileType = file.FileType,
+                    FileTypeName = FileTypeHelper.GetFileTypeName(file.FileType),
+                    FileExistsInFile = true,
+                    FileExistsInPlc = existsInPlc,
+                    SizeMatches = sizeMatches,
+                    FileSizeBytes = file.NumberOfBytes,
+                    PlcSizeBytes = existsInPlc ? plcFile.NumberOfBytes : (int?)null,
+                    FileCrc32 = fileCrc,
+                    PlcCrc32 = plcCrc,
+                    DataMatches = dataMatches
+                });
+            }
+
+            // Files in PLC but not in backup
+            foreach (var plcFile in plcFiles)
+            {
+                if (!fileFiles.Any(f => f.FileNumber == plcFile.FileNumber && f.FileType == plcFile.FileType))
+                {
+                    results.Add(new FullCompareResult
+                    {
+                        FileNumber = plcFile.FileNumber,
+                        FileType = plcFile.FileType,
+                        FileTypeName = FileTypeHelper.GetFileTypeName(plcFile.FileType),
+                        FileExistsInFile = false,
+                        FileExistsInPlc = true,
+                        SizeMatches = false,
+                        FileSizeBytes = null,
+                        PlcSizeBytes = plcFile.NumberOfBytes,
+                        DataMatches = false
+                    });
+                }
+            }
+
+            return results.OrderBy(r => r.FileNumber).ThenBy(r => r.FileType).ToList();
+        });
     }
 }

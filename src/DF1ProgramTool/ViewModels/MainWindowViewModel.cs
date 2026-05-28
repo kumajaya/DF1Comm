@@ -2,16 +2,21 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO.Ports;
+using System.Linq;
 using System.Reactive;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Controls.Primitives;
+using Avalonia.Data;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Styling;
 using DF1Comm;
 using DF1ProgramTool.Models;
 using DF1ProgramTool.Services;
@@ -98,6 +103,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             this.RaiseAndSetIfChanged(ref _isBusy, value);
             this.RaisePropertyChanged(nameof(CanUpload));
             this.RaisePropertyChanged(nameof(CanDownload));
+            this.RaisePropertyChanged(nameof(CanCompare));
         }
     }
 
@@ -109,6 +115,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             this.RaiseAndSetIfChanged(ref _isConnected, value);
             this.RaisePropertyChanged(nameof(CanUpload));
             this.RaisePropertyChanged(nameof(CanDownload));
+            this.RaisePropertyChanged(nameof(CanCompare));
         }
     }
 
@@ -142,6 +149,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
     public bool CanUpload   => IsConnected && !IsBusy && _currentPlcInfo.SupportsUploadDownload;
     public bool CanDownload => IsConnected && !IsBusy && _currentPlcInfo.SupportsUploadDownload;
+    public bool CanCompare => IsConnected && !IsBusy && _currentPlcInfo.SupportsUploadDownload;
 
     // ─── Commands ─────────────────────────────────────────────────────────────
     public ReactiveCommand<Unit, Unit> RefreshPortsCommand { get; }
@@ -150,6 +158,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     public ReactiveCommand<Unit, Unit> UploadCommand       { get; }
     public ReactiveCommand<Unit, Unit> DownloadCommand     { get; }
     public ReactiveCommand<Unit, Unit> ClearLogCommand     { get; }
+    public ReactiveCommand<Unit, Unit> CompareCommand      { get; }
 
     private void OnRawFrameSent(object? sender, byte[] frame)     => AppendLog($"TX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
     private void OnRawFrameReceived(object? sender, byte[] frame) => AppendLog($"RX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
@@ -171,6 +180,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         UploadCommand       = ReactiveCommand.CreateFromTask(UploadAsync,   canUpload);
         DownloadCommand     = ReactiveCommand.CreateFromTask(DownloadAsync, canDownload);
         ClearLogCommand     = ReactiveCommand.Create(ClearLog);
+        CompareCommand      = ReactiveCommand.CreateFromTask(CompareAsync, this.WhenAnyValue(x => x.CanCompare));
 
         RefreshPorts();
     }
@@ -530,6 +540,136 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         else               dialog.Show();
 
         return result;
+    }
+
+    // ─── Compare ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Entry point for the Compare command. Prompts the user to select a backup
+    /// .bin file, asks whether to run a full (structure + data) or structure-only
+    /// comparison, then delegates to ProgramTransferService and shows the results.
+    /// </summary>
+    private async Task CompareAsync()
+    {
+        if (_df1 == null) return;
+
+        var topLevel = GetMainWindow();
+        if (topLevel == null) return;
+
+        // Let the user pick the backup file to compare against the live PLC
+        var files = await topLevel.StorageProvider.OpenFilePickerAsync(
+            new Avalonia.Platform.Storage.FilePickerOpenOptions
+            {
+                Title = "Select backup file to compare",
+                AllowMultiple = false,
+                FileTypeFilter = new[]
+                {
+                    new Avalonia.Platform.Storage.FilePickerFileType("Binary file") { Patterns = new[] { "*.bin" } },
+                    new Avalonia.Platform.Storage.FilePickerFileType("All files")   { Patterns = new[] { "*.*" } }
+                }
+            });
+
+        if (files == null || files.Count == 0) return;
+        string filePath = files[0].Path.LocalPath;
+
+        await RunTransferAsync(async (progressMsg, progressPct, ct) =>
+        {
+            var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct);
+            var results = await svc.CompareFullAsync(filePath);
+            await ShowCompareResultsAsync(results);
+        }, "Compare");
+    }
+
+    /// <summary>
+    /// Displays comparison results in a modal DataGrid window.
+    /// </summary>
+    private async Task ShowCompareResultsAsync<T>(List<T> results) where T : StructureCompareResult
+    {
+        if (!results.Any())
+        {
+            await ShowMessageAsync("Compare Result", "No differences found — files match.");
+            return;
+        }
+
+        // Determine display mode before entering the UI thread dispatch
+        var isFullCompare = results.Any(x => x is FullCompareResult);
+
+        // ShowDialog must be called on the UI thread; RunTransferAsync resumes
+        // on a thread-pool thread, so we marshal explicitly here.
+        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+        {
+            var window = new Window
+            {
+                Title  = isFullCompare ? "Full Compare Results" : "Structure Compare Results",
+                Width  = 800,
+                Height = 600,
+                // SizeToContent.Manual is required so the window respects the
+                // explicit Width/Height above and does not attempt to size itself
+                // to the DataGrid's initial (possibly zero) desired size.
+                SizeToContent         = SizeToContent.Manual,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+
+            // ── DataGrid ──────────────────────────────────────────────────────
+            var dataGrid = new DataGrid
+            {
+                AutoGenerateColumns      = false,
+                CanUserResizeColumns     = true,
+                Margin                   = new Thickness(10, 10, 10, 0),
+                ItemsSource              = results,
+                // Stretch is required so the DataGrid fills the Star row in the
+                // Grid layout below; without it the row collapses to zero height.
+                VerticalAlignment        = VerticalAlignment.Stretch,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                VerticalScrollBarVisibility   = ScrollBarVisibility.Auto
+            };
+
+            // Common columns — present for both structure-only and full compare
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "File",                Binding = new Binding("FileTypeName"),  Width = new DataGridLength(100) });
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "#",                   Binding = new Binding("FileNumber"),    Width = new DataGridLength(50)  });
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Backup (bytes)", Binding = new Binding("SizeDisplay"),   Width = new DataGridLength(120) });
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "PLC (bytes)",    Binding = new Binding("PlcSizeDisplay"),Width = new DataGridLength(120) });
+            dataGrid.Columns.Add(new DataGridTextColumn { Header = "Structure",           Binding = new Binding("StructureStatus"),Width = new DataGridLength(100)});
+
+            // Data column — only shown for full compare results
+            if (isFullCompare)
+                dataGrid.Columns.Add(new DataGridTextColumn { Header = "Data", Binding = new Binding("DataStatus"), Width = new DataGridLength(250) });
+
+            // Color each row green (match) or pink (mismatch) as it loads.
+            // LoadingRow fires on the UI thread per row, making it the safest
+            // place to set row background without touching the ControlTheme.
+            dataGrid.LoadingRow += (_, e) =>
+            {
+                if (e.Row.DataContext is StructureCompareResult r)
+                    e.Row.Background = r.StructureMatch
+                        ? new SolidColorBrush(Colors.LightGreen)
+                        : new SolidColorBrush(Colors.LightPink);
+            };
+
+            // ── Layout ────────────────────────────────────────────────────────
+            // Grid with two rows: DataGrid fills all available space (Star),
+            // Close button sits below it at its natural height (Auto).
+            var closeButton = new Button
+            {
+                Content             = "Close",
+                Width               = 80,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin              = new Thickness(10)
+            };
+            closeButton.Click += (_, _) => window.Close();
+
+            var grid = new Grid();
+            grid.RowDefinitions.Add(new RowDefinition(GridLength.Star));
+            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+
+            Grid.SetRow(dataGrid,     0);
+            Grid.SetRow(closeButton,  1);
+            grid.Children.Add(dataGrid);
+            grid.Children.Add(closeButton);
+
+            window.Content = grid;
+            await window.ShowDialog(GetMainWindow()!);
+        });
     }
 
     private static Window BuildDialog(string title, string message, Control actionControl) =>

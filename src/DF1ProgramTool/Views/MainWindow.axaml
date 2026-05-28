@@ -108,6 +108,13 @@
                                 Background="#C62828"
                                 Foreground="White"
                                 BorderThickness="0" />
+                        <Button Content="Compare"
+                                Command="{Binding CompareCommand}"
+                                IsEnabled="{Binding CanCompare}"
+                                Width="170"
+                                Background="#1565C0"
+                                Foreground="White"
+                                BorderThickness="0" />
                     </StackPanel>
                 </StackPanel>
             </Border>

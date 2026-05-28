@@ -3,6 +3,7 @@ using System.Linq;
 using System.Text;
 using System.Collections.Generic;
 
+using DF1ProgramTool.Models;
 namespace DF1ProgramTool.Services;
 
 public static class FrameDecoder
@@ -25,21 +26,6 @@ public static class FrameDecoder
                 list.Add(b);
         }
         return list.ToArray();
-    }
-
-    /// <summary>
-    /// Returns bytes per element for SLC 500 file types.
-    /// Defaults to 2 (word) for unknown types.
-    /// </summary>
-    private static int GetBytesPerElement(int fileType)
-    {
-        return fileType switch
-        {
-            0x86 or 0x87 or 0x88 => 6, // Timer, Counter, Control
-            0x8A => 4,                 // Float
-            0x8D => 84,                // String
-            _ => 2                     // Word (Integer, Binary, Status, I/O)
-        };
     }
 
     public static string Decode(byte[] raw)
@@ -71,19 +57,14 @@ public static class FrameDecoder
         if (cmd == 0x0F && (fnc == 0xA1 || fnc == 0xA2 || fnc == 0xAA || fnc == 0xAB) && data.Length >= 4)
         {
             int size = data[0], fileNum = data[1], fileType = data[2];
-            string typeStr = fileType switch
-            {
-                0x84 => "Status", 0x85 => "Binary", 0x86 => "Timer", 0x87 => "Counter",
-                0x88 => "Control", 0x89 => "Integer", 0x8A => "Float", 0x8B => "Output",
-                0x8C => "Input", 0x8D => "String", _ => $"0x{fileType:X2}"
-            };
+            string typeStr = FileTypeHelper.GetFileTypeName(fileType);
             int elem = data[3], idx = 4;
             if (elem == 0xFF && data.Length >= idx+2) { elem = data[idx] | (data[idx+1] << 8); idx += 2; }
 
             // size is the number of bytes requested in this transaction — not the total file size.
             // For large files (e.g. T4=468 bytes) DF1Comm splits into multiple transactions
             // (max 236 bytes each), so size/bpe reflects only this transaction's portion.
-            int bpe = GetBytesPerElement(fileType);
+            int bpe = FileTypeHelper.GetBytesPerElement(fileType);
             int wordsRequested = size / bpe;
             sb.Append($"              Size={size} bytes ({wordsRequested} {(bpe == 2 ? "words" : "elements")}), File={fileNum}, Type={typeStr}, Element={elem}");
             if ((fnc == 0xA2 || fnc == 0xAB) && data.Length > idx)
