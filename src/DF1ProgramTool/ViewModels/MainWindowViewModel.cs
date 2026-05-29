@@ -377,7 +377,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
                 byte modeByte = data[18];
                 string modeStr = PlcIdentifier.DecodeModeString(modeByte);
                 CurrentPlcInfo = CurrentPlcInfo with { ModeStr = modeStr };
-                StatusText = $"Connected | {_currentPlcInfo.Name} | {modeStr}";
+                StatusText = $"Connected | {_currentPlcInfo.Name} (0x{_currentPlcInfo.ProcessorType:X2}) | {modeStr}";
             }
             else
             {
@@ -417,7 +417,9 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
 
         bool confirmed = await _dialogService.ShowConfirmAsync(
             "Confirm Download",
-            "This will overwrite the PLC program with the file contents.\nContinue?");
+            "This will overwrite the PLC program with the file contents.\n\n" +
+            "The PLC will be switched to PROGRAM mode during download.\n\n" +
+            "Continue?");
         if (!confirmed) return;
 
         int targetProc = _currentPlcInfo.ProcessorType;
@@ -473,6 +475,30 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             await work(progressMsg, progressPct, _cts.Token);
             AppendLog($"--- {operationName} complete ---");
             await RefreshPlcStatusAsync();
+            if (operationName == "Download")
+            {
+                 bool switchToRun = await _dialogService.ShowConfirmAsync(
+                    "Download Complete",
+                    "Download finished successfully.\n\nSwitch to RUN mode now?");
+                
+                if (switchToRun)
+                {
+                    try
+                    {
+                        await Task.Run(() => _df1!.SetRunMode());
+                        AppendLog("Switched to RUN mode.");
+                        await RefreshPlcStatusAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"Failed to switch to RUN mode: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    AppendLog("PLC remains in PROGRAM mode.");
+                }
+            }
             await _dialogService.ShowMessageAsync($"{operationName} Complete",
                 $"{operationName} finished successfully.");
         }
