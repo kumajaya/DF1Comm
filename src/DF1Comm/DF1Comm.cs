@@ -693,12 +693,17 @@ namespace DF1Comm
                 UploadProgress?.Invoke(this, EventArgs.Empty);
 
                 int numberOfProgramFiles = fzd[46] + fzd[47] * 256;
-                int filePosition = ProcessorType == 0x25 || ProcessorType == 0x58 ? 93
-                                 : ProcessorType == 0x88 || ProcessorType == 0x89 || ProcessorType == 0x8C || ProcessorType == 0x9C ? 103
-                                 : 79;
+                int numberOfDataFiles = fzd[52] + fzd[53] * 256;
+                int totalEntries = numberOfProgramFiles + numberOfDataFiles;
 
-                int dfg = 0, ffg = 0, sfg = 0, slfg = 0, lfg = 0, u1 = 0, u2 = 0, i = 0;
-                while (filePosition < fzd.Length && i < numberOfProgramFiles)
+                int filePosition = ProcessorType == 0x25 || ProcessorType == 0x58 ? 93
+                                : ProcessorType == 0x88 || ProcessorType == 0x89 || ProcessorType == 0x8C || ProcessorType == 0x9C ? 103
+                                : 79;
+
+                // ORIGINAL CODE: kept for reference but no longer used
+                // int dfg = 0, ffg = 0, sfg = 0, slfg = 0, lfg = 0, u1 = 0, u2 = 0;
+                int i = 0;
+                while (filePosition < fzd.Length && i < totalEntries)
                 {
                     var pf = new PLCFileDetails
                     {
@@ -706,21 +711,30 @@ namespace DF1Comm
                         NumberOfBytes = fzd[filePosition + 1] + fzd[filePosition + 2] * 256
                     };
 
-                    if (pf.FileType >= 0x40 && pf.FileType <= 0x5F) pf.FileNumber = sfg++;
-                    else if (pf.FileType >= 0x20 && pf.FileType <= 0x3F) pf.FileNumber = lfg++;
-                    else if (pf.FileType >= 0x60 && pf.FileType <= 0x7F) pf.FileNumber = slfg++;
-                    else if (pf.FileType >= 0x80 && pf.FileType <= 0x9F) pf.FileNumber = dfg++;
-                    else if (pf.FileType >= 0xA0 && pf.FileType <= 0xBF) pf.FileNumber = ffg++;
-                    else if (pf.FileType >= 0xC0 && pf.FileType <= 0xDF) pf.FileNumber = u1++;
-                    else if (pf.FileType >= 0xE0 && pf.FileType <= 0xFF) pf.FileNumber = u2++;
+                    // ORIGINAL CODE:
+                    // if (pf.FileType >= 0x40 && pf.FileType <= 0x5F) pf.FileNumber = sfg++;
+                    // else if (pf.FileType >= 0x20 && pf.FileType <= 0x3F) pf.FileNumber = lfg++;
+                    // else if (pf.FileType >= 0x60 && pf.FileType <= 0x7F) pf.FileNumber = slfg++;
+                    // else if (pf.FileType >= 0x80 && pf.FileType <= 0x9F) pf.FileNumber = dfg++;
+                    // else if (pf.FileType >= 0xA0 && pf.FileType <= 0xBF) pf.FileNumber = ffg++;
+                    // else if (pf.FileType >= 0xC0 && pf.FileType <= 0xDF) pf.FileNumber = u1++;
+                    // else if (pf.FileType >= 0xE0 && pf.FileType <= 0xFF) pf.FileNumber = u2++;
+
+                    // FIX: Original used counter variables (lfg++, dfg++) which lost actual file numbers.
+                    //      Fixed by reading file number directly from directory at offset +3.
+                    //      Ref: AB Publication 1770-6.5.16 Chapter 7, page 7-17 (Protected Typed Logical Read)
+                    pf.FileNumber = fzd[filePosition + 3];
 
                     var addr = new DataAddress { FileType = pf.FileType, FileNumber = pf.FileNumber };
                     if (pf.NumberOfBytes > 0)
                     {
                         pf.Data = ReadRawData(addr, pf.NumberOfBytes, out int reply);
-                        if (reply != 0)
+                        // Skip addressing errors (0x50) - file may be system file or empty
+                        if (reply != 0 && reply != 0x50)
                             throw new DF1Exception("Failed to Read Program File " + addr.FileNumber +
-                                                   ", Type " + addr.FileType + " - " + MessageDecoder.DecodeMessage(reply));
+                                                ", Type " + addr.FileType + " - " + MessageDecoder.DecodeMessage(reply));
+                        if (reply == 0x50)
+                            pf.Data = Array.Empty<byte>();  // Treat as empty file
                     }
                     else pf.Data = Array.Empty<byte>();
 

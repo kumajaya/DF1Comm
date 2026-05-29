@@ -97,8 +97,15 @@ public class PlcMemory
 
     private void BuildDirectory()
     {
-        // 79-byte header + 56 entries × 10 bytes = 639 bytes total.
-        // 56 entries = 32 data files + 2 SYS + 22 LAD (files 2–23).
+        // Directory size calculation:
+        //   79 bytes header + 56 entries × 10 bytes = 639 bytes total
+        //   56 entries = 32 data file slots + 24 program file slots
+        //
+        // Note: This 639 bytes is the size of File 0 (directory) itself.
+        //       It is NOT the "Total Memory (Words): 714" shown in RSLogix.
+        //       The 714 words is the sum of user data table words (O, I, B, N, F, T, C, R files)
+        //       which is calculated from sizeBytes of each data file registered below.
+        //
         const int dirSize = 639;
         var dir = new byte[dirSize];
 
@@ -152,12 +159,12 @@ public class PlcMemory
         Reg(0x85,  82, 16);       // B16 — 41 words
         Reg(0x89,  52, 17);       // N17 — 26 words
 
-        // Files 18–28: inactive slots (type 0x8D = ST, size 0).
+        // Files 18–28: inactive slots (type 0x85 = Binary, size 0).
         // RSLogix shows Total Files=32, Active Files=21; these occupy directory
         // slots but have no data and do not appear in RSLogix file lists.
         for (int n = 18; n <= 28; n++)
         {
-            dir[pos]     = 0x8D;    // ST (string) — inactive marker
+            dir[pos]     = 0x85;
             dir[pos + 1] = 0x00;
             dir[pos + 2] = 0x00;
             dir[pos + 3] = (byte)n;
@@ -197,10 +204,10 @@ public class PlcMemory
         for (int n = 2; n <= 23; n++)
         {
             bool active = Array.IndexOf(activeLad, n) >= 0;
-            int sizeWords = active ? rungs[n] * wordsPerRung : 1;
+            int sizeWords = active ? rungs[n] * wordsPerRung : 0;
             
             // Use FileType in the range 0x20-0x3F
-            byte fileType = active ? (byte)(0x20 + (n - 2)) : (byte)0x00;
+            byte fileType = (byte)(0x20 + (n - 2));
             
             dir[pos]     = fileType;
             dir[pos + 1] = (byte)(sizeWords & 0xFF);
@@ -209,16 +216,10 @@ public class PlcMemory
             // bytes 4–9 remain zero
             pos += 10;
 
-            if (active)
-            {
-                _fileTypeByNumber[n] = fileType;
-                // Allocate storage for ladder logic (used when writing to program files)
-                if (!_files.ContainsKey((fileType, n)))
-                {
-                    _files[(fileType, n)] = new byte[sizeWords * 2];
-                    _bytesPerElement[(fileType, n)] = 0;
-                }
-            }
+            _fileTypeByNumber[n] = fileType;
+            // Allocate storage for ladder logic (used when writing to program files)
+            _files[(fileType, n)] = new byte[sizeWords * 2];
+            _bytesPerElement[(fileType, n)] = 0;
         }
 
         _files[(1, 0)] = dir;

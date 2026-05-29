@@ -28,7 +28,11 @@ public static class FileTypeHelper
             0x92 => "MG (Message)",
             0x93 => "PD (PID)",
             0x94 => "PLS (Limit Switch)",
-            >= 0xA0 and <= 0xAF => "LAD (Program)",
+            >= 0x01 and <= 0x1F => "SYS (System)",     // System files
+            >= 0x20 and <= 0x3F => "LAD (Program)",    // Range for LAD
+            >= 0x40 and <= 0x5F => "SYS (System)",     // Another system range
+            >= 0x60 and <= 0x7F => "I/O Config",       // I/O configuration files
+            >= 0x80 and <= 0x9F => "Data",             // Data files
             _ => $"0x{fileType:X2}"
         };
     }
