@@ -173,6 +173,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     public ReactiveCommand<Unit, Unit> DownloadCommand     { get; }
     public ReactiveCommand<Unit, Unit> ClearLogCommand     { get; }
     public ReactiveCommand<Unit, Unit> CompareCommand      { get; }
+    public ReactiveCommand<Unit, Unit> AboutCommand    { get; }
 
     private void OnRawFrameSent(object? sender, byte[] frame)     => AppendLog($"TX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
     private void OnRawFrameReceived(object? sender, byte[] frame) => AppendLog($"RX  {FrameDecoder.Hex(frame)}\n    {FrameDecoder.Decode(frame)}");
@@ -197,6 +198,7 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         DownloadCommand     = ReactiveCommand.CreateFromTask(DownloadAsync, canDownload);
         ClearLogCommand     = ReactiveCommand.Create(ClearLog);
         CompareCommand      = ReactiveCommand.CreateFromTask(CompareAsync, this.WhenAnyValue(x => x.CanCompare));
+        AboutCommand        = ReactiveCommand.Create(ShowAbout);
 
         RefreshPorts();
     }
@@ -250,6 +252,21 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         _logBuffer.Clear();
         _logLineCount = 0;
         LogText = string.Empty;
+    }
+
+    // ─── About ───────────────────────────────────────────────────────────────
+    private async void ShowAbout()
+    {
+        var version = System.Reflection.Assembly.GetExecutingAssembly()
+            .GetName().Version?.ToString() ?? "1.0";
+        
+        await _dialogService.ShowMessageAsync(
+            "About DF1 Program Transfer Tool",
+            $"DF1 Program Transfer Tool\n" +
+            $"Version {version}\n\n" +
+            "A simple tool to upload/download SLC/MicroLogix PLC programs via DF1 protocol.\n\n" +
+            "© 2026 Ketut Kumajaya, Samator Indo Gas\n\n" +
+            "License: GPL-3.0-or-later");
     }
 
     // ─── Port management ─────────────────────────────────────────────────────
