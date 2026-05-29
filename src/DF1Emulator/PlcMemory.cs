@@ -65,6 +65,7 @@ using System.Collections.Generic;
 ///
 /// Program files (Total=24, Active=10):
 ///   File 0–1: SYS; Files 2–23: LAD (active: 2, 3, 5, 8, 12, 15, 18, 19, 22, 23)
+///   LAD file size = rungs × 2 words (realistic estimate)
 ///
 /// Rack (1746-A7, 7 slots):
 ///   Slot 0: 1747-L532E  CPU           no I/O image
@@ -169,23 +170,55 @@ public class PlcMemory
         Reg(0x85, 52, 31);        // B31 — 26 words
 
         // ── Program files ────────────────────────────────────────────────────
+        // Rung counts per file from baseline, with realistic size: 2 words per rung
+        var rungs = new Dictionary<int, int>
+        {
+            {2, 23}, {3, 13}, {5, 24}, {8, 26}, {12, 16},
+            {15, 22}, {18, 18}, {19, 6}, {22, 14}, {23, 9}
+        };
+        int[] activeLad = { 2, 3, 5, 8, 12, 15, 18, 19, 22, 23 };
+        const int wordsPerRung = 2;   // realistic estimate: 2 words per rung
+
         // SYS file 0
-        dir[pos]     = 0x01; dir[pos + 1] = 0x01;
-        dir[pos + 3] = 0x00; pos += 10;
+        dir[pos]     = 0x01;
+        dir[pos + 1] = 0x01;   // size = 1 word
+        dir[pos + 3] = 0x00;
+        pos += 10;
+        _fileTypeByNumber[0] = 0x01;
 
         // SYS file 1
-        dir[pos]     = 0x01; dir[pos + 1] = 0x01;
-        dir[pos + 3] = 0x01; pos += 10;
+        dir[pos]     = 0x01;
+        dir[pos + 1] = 0x01;   // size = 1 word
+        dir[pos + 3] = 0x01;
+        pos += 10;
+        _fileTypeByNumber[1] = 0x01;
 
-        // LAD files 2–23 (active: 2, 3, 5, 8, 12, 15, 18, 19, 22, 23)
-        int[] activeLad = { 2, 3, 5, 8, 12, 15, 18, 19, 22, 23 };
+        // LAD files 2–23
         for (int n = 2; n <= 23; n++)
         {
             bool active = Array.IndexOf(activeLad, n) >= 0;
-            dir[pos]     = active ? (byte)0x02 : (byte)0x00;
-            dir[pos + 1] = active ? (byte)0x01 : (byte)0x00;
+            int sizeWords = active ? rungs[n] * wordsPerRung : 1;
+            
+            // Use FileType in the range 0x20-0x3F
+            byte fileType = active ? (byte)(0x20 + (n - 2)) : (byte)0x00;
+            
+            dir[pos]     = fileType;
+            dir[pos + 1] = (byte)(sizeWords & 0xFF);
+            dir[pos + 2] = (byte)((sizeWords >> 8) & 0xFF);
             dir[pos + 3] = (byte)n;
+            // bytes 4–9 remain zero
             pos += 10;
+
+            if (active)
+            {
+                _fileTypeByNumber[n] = fileType;
+                // Allocate storage for ladder logic (used when writing to program files)
+                if (!_files.ContainsKey((fileType, n)))
+                {
+                    _files[(fileType, n)] = new byte[sizeWords * 2];
+                    _bytesPerElement[(fileType, n)] = 0;
+                }
+            }
         }
 
         _files[(1, 0)] = dir;
