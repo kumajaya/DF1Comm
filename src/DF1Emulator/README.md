@@ -116,6 +116,69 @@ sudo usermod -a -G dialout $USER
 
 *RSLinx OPC Server accessing DF1Emulator memory in the background*
 
+## Emulated SLC 5/03 Memory Layout
+
+The emulator simulates a specific SLC 5/03 configuration with the following data files and program files.
+
+### Data Files
+
+**Total Files:** 32 | **Active Files:** 21 | **Total Memory (Words):** 714
+
+| File | Type | Elem | WORDS | Last     |
+|------|------|------|-------|----------|
+| 0    | O    | 2    | 6     | O:1      |
+| 1    | I    | 7    | 21    | I:6      |
+| 2    | S    | 83   | 0     | S:82     |
+| 3    | B    | 14   | 14    | B3:13    |
+| 4    | T    | 78   | 234   | T4:77    |
+| 5    | C    | 1    | 3     | C5:0     |
+| 6    | R    | 2    | 6     | R6:1     |
+| 7    | N    | 74   | 74    | N7:73    |
+| 8    | F    | 38   | 76    | F8:37    |
+| 9    | B    | 10   | 10    | B9:9     |
+| 10   | B    | 71   | 71    | B10:70   |
+| 11   | B    | 9    | 9     | B11:8    |
+| 12   | B    | 1    | 1     | B12:0    |
+| 13   | B    | 2    | 2     | B13:1    |
+| 14   | B    | 1    | 1     | B14:0    |
+| 15   | B    | 41   | 41    | B15:40   |
+| 16   | B    | 41   | 41    | B16:40   |
+| 17   | N    | 26   | 26    | N17:25   |
+| 29   | B    | 26   | 26    | B29:25   |
+| 30   | B    | 26   | 26    | B30:25   |
+| 31   | B    | 26   | 26    | B31:25   |
+
+### Program Files
+
+**Total Files:** 24 | **Active Files:** 10
+
+| Name                         | File | Type | Rungs |
+|------------------------------|------|------|-------|
+| SYSTEM DATA STORAGE HEADER   | 0    | SYS  | 0     |
+| RESERVED FOR FUTURE USE      | 1    | SYS  | 0     |
+| (no name)                    | 2    | LAD  | 23    |
+| (no name)                    | 3    | LAD  | 13    |
+| (no name)                    | 5    | LAD  | 24    |
+| (no name)                    | 8    | LAD  | 26    |
+| (no name)                    | 12   | LAD  | 16    |
+| (no name)                    | 15   | LAD  | 22    |
+| (no name)                    | 18   | LAD  | 18    |
+| (no name)                    | 19   | LAD  | 6     |
+| (no name)                    | 22   | LAD  | 14    |
+| (no name)                    | 23   | LAD  | 9     |
+
+### I/O Configuration
+
+| Slot | Module      | Type           | Description                     |
+|------|-------------|----------------|---------------------------------|
+| 0    | 1747-L532E  | CPU            |                                 |
+| 1    | 1746-IB16   | Digital Input  | 16 inputs, 2 bytes              |
+| 2    | 1746-IB16   | Digital Input  | 16 inputs, 2 bytes              |
+| 3    | 1746-IB16   | Digital Input  | 16 inputs, 2 bytes              |
+| 4    | 1746-OB16   | Digital Output | 16 outputs, 2 bytes             |
+| 5    | 1746-OB16   | Digital Output | 16 outputs, 2 bytes             |
+| 6    | 1746-NI4    | Analog Input   | 4 channels × 2 bytes = 8 bytes  |
+
 ## Project structure
 | File | Description |
 |------|-------------|
@@ -144,4 +207,4 @@ Same as the DF1Comm library.
 ## Contributing
 - Fork, create a feature branch, and open a pull request.
 - Keep the code **self‑contained** (no external DF1 library dependencies).
-- Add unit tests for new features (mock `SerialPort` if needed).
+- Add unit tests for new features (mock `SerialPort` if needed).'
