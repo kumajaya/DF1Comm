@@ -464,13 +464,20 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             "Continue?");
         if (!confirmed) return;
 
+        // Set to PROGRAM mode NOW and refresh UI
+        AppendLog("Setting PLC to Program mode…");
+        await Task.Run(() => _df1.SetProgramMode());
+        AppendLog("PLC switched to PROGRAM mode.");
+        await RefreshPlcStatusAsync();  // StatusText now shows PROGRAM
+        await FlushLogsAsync();
+
         int targetProc = _currentPlcInfo.ProcessorType;
         string targetBulletin = _currentPlcInfo.Bulletin;
 
         await RunTransferAsync(async (progressMsg, progressPct, ct) =>
         {
             var svc = new ProgramTransferService(_df1!, progressMsg, progressPct, ct, _currentPlcInfo);
-            await svc.DownloadFromFileAsync(filePath, targetProc, targetBulletin);
+            await svc.DownloadFromFileAsync(filePath, targetProc, targetBulletin, skipSetProgramMode: true);
         }, "Download");
     }
 

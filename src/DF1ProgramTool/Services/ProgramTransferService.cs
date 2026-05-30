@@ -92,7 +92,8 @@ public class ProgramTransferService
         }, _cancellationToken);
     }
 
-    public async Task DownloadFromFileAsync(string filePath, int targetProcessorType, string targetBulletin)
+    public async Task DownloadFromFileAsync(string filePath, int targetProcessorType, 
+        string targetBulletin, bool skipSetProgramMode = false)
     {
         _cancellationToken.ThrowIfCancellationRequested();
 
@@ -105,9 +106,12 @@ public class ProgramTransferService
             
             long totalBytes = files.Sum(f => f.Data?.Length ?? 0);
 
-            // DF1Comm.SetProgramMode() throws on failure; let the exception propagate
-            _progressMessage?.Report($"Setting PLC to Program mode…");
-            _df1.SetProgramMode();
+            if (!skipSetProgramMode)
+            {
+                // DF1Comm.SetProgramMode() throws on failure; let the exception propagate
+                _progressMessage?.Report($"Setting PLC to Program mode…");
+                _df1.SetProgramMode();
+            }
 
             _cancellationToken.ThrowIfCancellationRequested();
 
