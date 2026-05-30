@@ -105,8 +105,6 @@ namespace DF1Comm
         public event EventHandler? DataReceived;
         public event EventHandler? UnsolicitedMessageRcvd;
         public event EventHandler? AutoDetectTry;
-        public event EventHandler? DownloadProgress;
-        public event EventHandler? UploadProgress;
         public event EventHandler<FileProgressEventArgs>? FileProgress;
 
         // Events for logging support
@@ -718,7 +716,6 @@ namespace DF1Comm
                 byte[] fzd = ReadFileDirectory();
                 var programFiles = new Collection<PLCFileDetails>();
                 programFiles.Add(new PLCFileDetails { FileNumber = 0, Data = fzd, FileType = 0, NumberOfBytes = fzd.Length });
-                UploadProgress?.Invoke(this, EventArgs.Empty);
 
                 // Fire FileProgress for directory
                 FileProgress?.Invoke(this, new FileProgressEventArgs
@@ -812,7 +809,6 @@ namespace DF1Comm
                         GrandTotalBytes = grandTotalBytes
                     });
 
-                    UploadProgress?.Invoke(this, EventArgs.Empty);
                     i++;
                     filePosition += (ProcessorType == 0x25 || ProcessorType == 0x58) ? 8 : 10;
                 }
@@ -831,7 +827,6 @@ namespace DF1Comm
             try
             {
                 SetProgramMode();
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 // Calculate grand total bytes
                 long grandTotalBytes = plcFiles.Sum(f => f.Data?.Length ?? 0);
@@ -884,13 +879,11 @@ namespace DF1Comm
 
                 int reply = PrefixAndSend(0xF, 0x88, data, true, out _);
                 if (reply != 0) throw new DF1Exception("Failed to Initialize for Download - " + MessageDecoder.DecodeMessage(reply));
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 byte[] empty = Array.Empty<byte>();
 
                 reply = PrefixAndSend(0xF, 0x11, empty, true, out _);
                 if (reply != 0) throw new DF1Exception("Failed to Secure Sole Access - " + MessageDecoder.DecodeMessage(reply));
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 pAddr.BitNumber = 16;
                 byte[] data3 = { (byte)(plcFiles[0].Data.Length & 0xFF), (byte)((plcFiles[0].Data.Length >> 8) & 0xFF) };
@@ -910,7 +903,6 @@ namespace DF1Comm
                     TotalBytesTransferred = totalBytesTransferred,
                     GrandTotalBytes = grandTotalBytes
                 });
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 pAddr.Element = 0;
                 reply = WriteRawData(pAddr, plcFiles[0].Data.Length, plcFiles[0].Data);
@@ -929,7 +921,6 @@ namespace DF1Comm
                     TotalBytesTransferred = totalBytesTransferred,
                     GrandTotalBytes = grandTotalBytes
                 });
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 for (int i = 1; i < plcFiles.Count; i++)
                 {
@@ -955,17 +946,13 @@ namespace DF1Comm
                         TotalBytesTransferred = totalBytesTransferred,
                         GrandTotalBytes = grandTotalBytes
                     });
-
-                    DownloadProgress?.Invoke(this, EventArgs.Empty);
                 }
 
                 reply = PrefixAndSend(0xF, 0x52, empty, true, out _);
                 if (reply != 0) throw new DF1Exception("Failed to Indicate to PLC that Download is complete - " + MessageDecoder.DecodeMessage(reply));
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 reply = PrefixAndSend(0xF, 0x12, empty, true, out _);
                 if (reply != 0) throw new DF1Exception("Failed to Release Sole Access - " + MessageDecoder.DecodeMessage(reply));
-                DownloadProgress?.Invoke(this, EventArgs.Empty);
             }
             finally
             {
