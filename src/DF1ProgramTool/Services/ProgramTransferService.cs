@@ -42,20 +42,28 @@ public class ProgramTransferService
         {
             _progressMessage?.Report("Reading program directory…");
 
-            // Subscribe before calling UploadProgramData so we can count events
-            int completedSteps = 0;
-            // DF1Comm fires UploadProgress once per program file written; there is no
-            // pre-known total, so we report indeterminate progress until the call returns.
-            EventHandler progressHandler = (_, _) =>
+            long totalBytes = 0;
+            long transferredBytes = 0;
+            int totalFiles = 0;
+            int completedFiles = 0;
+
+            // Subscribe to new FileProgress event
+            EventHandler<global::DF1Comm.DF1Comm.FileProgressEventArgs> progressHandler = (_, e) =>
             {
-                completedSteps++;
-                _progressMessage?.Report($"Uploading file {completedSteps}…");
-                // Indeterminate: pulse the bar in increments of 5, capped at 90
-                double pct = Math.Min(completedSteps * 5.0, 90.0);
-                _progressPercent?.Report(pct);
+                completedFiles = e.FilesCompleted;
+                totalFiles = e.TotalFiles;
+                transferredBytes = e.TotalBytesTransferred;
+                totalBytes = e.GrandTotalBytes;
+                
+                double pct = totalBytes > 0 
+                    ? (double)transferredBytes / totalBytes * 100.0
+                    : (double)completedFiles / totalFiles * 100.0;
+                
+                _progressPercent?.Report(Math.Min(pct, 95.0));
+                _progressMessage?.Report($"Uploading {completedFiles} of {totalFiles} files ({transferredBytes}/{totalBytes} bytes)…");
             };
 
-            _df1.UploadProgress += progressHandler;
+            _df1.FileProgress += progressHandler;
             try
             {
                 _cancellationToken.ThrowIfCancellationRequested();
@@ -75,11 +83,11 @@ public class ProgramTransferService
                     SaveToFile(filePath, files);
 
                 _progressPercent?.Report(100);
-                _progressMessage?.Report($"Upload complete – {files.Count} program file(s).");
+                _progressMessage?.Report($"Upload complete – {files.Count} program file(s), {totalBytes} bytes.");
             }
             finally
             {
-                _df1.UploadProgress -= progressHandler;
+                _df1.FileProgress -= progressHandler;
             }
         }, _cancellationToken);
     }
@@ -94,39 +102,37 @@ public class ProgramTransferService
 
             // Validate against target PLC
             var files = LoadFromFileAndValidate(filePath, targetProcessorType, targetBulletin, requireBulletinMatch: true);
+            
+            long totalBytes = files.Sum(f => f.Data?.Length ?? 0);
 
             // DF1Comm.SetProgramMode() throws on failure; let the exception propagate
-            _progressMessage?.Report("Setting PLC to Program mode…");
+            _progressMessage?.Report($"Setting PLC to Program mode…");
             _df1.SetProgramMode();
 
             _cancellationToken.ThrowIfCancellationRequested();
 
-            int totalSteps = 0;
-            int completedSteps = 0;
-
-            EventHandler progressHandler = (_, _) =>
+            EventHandler<global::DF1Comm.DF1Comm.FileProgressEventArgs> progressHandler = (_, e) =>
             {
-                completedSteps++;
-                double pct = totalSteps > 0
-                    ? (double)completedSteps / totalSteps * 95.0
-                    : Math.Min(completedSteps * 5.0, 90.0);
+                double pct = e.GrandTotalBytes > 0 
+                    ? (double)e.TotalBytesTransferred / e.GrandTotalBytes * 100.0
+                    : (double)e.FilesCompleted / e.TotalFiles * 100.0;
+                
                 _progressPercent?.Report(pct);
-                _progressMessage?.Report($"Downloading step {completedSteps}" +
-                    (totalSteps > 0 ? $" of {totalSteps}…" : "…"));
+                _progressMessage?.Report($"Downloading {e.FilesCompleted} of {e.TotalFiles} files ({e.TotalBytesTransferred}/{e.GrandTotalBytes} bytes)…");
             };
 
-            _df1.DownloadProgress += progressHandler;
+            _df1.FileProgress += progressHandler;
             try
             {
                 _cancellationToken.ThrowIfCancellationRequested();
                 _df1.DownloadProgramData(files);
 
                 _progressPercent?.Report(100);
-                _progressMessage?.Report("Download complete.");
+                _progressMessage?.Report($"Download complete – {files.Count} file(s), {totalBytes} bytes.");
             }
             finally
             {
-                _df1.DownloadProgress -= progressHandler;
+                _df1.FileProgress -= progressHandler;
             }
         }, _cancellationToken);
     }
@@ -269,69 +275,110 @@ public class ProgramTransferService
     {
         return await Task.Run(() =>
         {
+            _progressMessage?.Report("Reading backup file…");
             var fileFiles = LoadFromFileAndValidate(filePath, 0, "", false);
-            var plcFiles = _df1.UploadProgramData();
+            
+            _progressMessage?.Report("Reading PLC program directory…");
+            
+            long totalBytes = 0;
+            long transferredBytes = 0;
+            int totalFiles = 0;
+            int completedFiles = 0;
 
-            var comparer = EqualityComparer<PLCFileDetails>.Default;
-            var results = new List<FullCompareResult>();
-
-            foreach (var file in fileFiles)
+            // Subscribe to FileProgress to track PLC upload progress
+            EventHandler<global::DF1Comm.DF1Comm.FileProgressEventArgs> progressHandler = (_, e) =>
             {
-                var plcFile = plcFiles.FirstOrDefault(f => f.FileNumber == file.FileNumber && f.FileType == file.FileType);
-                bool existsInPlc = !comparer.Equals(plcFile, default);
-                bool sizeMatches = existsInPlc && plcFile.NumberOfBytes == file.NumberOfBytes;
-                uint? fileCrc = null, plcCrc = null;
-                bool dataMatches = false;
+                completedFiles = e.FilesCompleted;
+                totalFiles = e.TotalFiles;
+                transferredBytes = e.TotalBytesTransferred;
+                totalBytes = e.GrandTotalBytes;
+                
+                double pct = totalBytes > 0 
+                    ? (double)transferredBytes / totalBytes * 100.0
+                    : (double)completedFiles / totalFiles * 100.0;
+                
+                _progressPercent?.Report(pct);
+                _progressMessage?.Report($"Reading PLC files: {completedFiles} of {totalFiles} ({transferredBytes}/{totalBytes} bytes)…");
+            };
 
-                if (existsInPlc && sizeMatches)
-                {
-                    fileCrc = Crc32.Compute(file.Data);
-                    plcCrc = Crc32.Compute(plcFile.Data);
-                    dataMatches = (fileCrc == plcCrc);
-                }
-
-                results.Add(new FullCompareResult
-                {
-                    FileNumber = file.FileNumber,
-                    FileType = file.FileType,
-                    FileTypeName = FileTypeHelper.GetFileTypeName(file.FileType),
-                    FileExistsInFile = true,
-                    FileExistsInPlc = existsInPlc,
-                    SizeMatches = sizeMatches,
-                    FileSizeBytes = file.NumberOfBytes,
-                    PlcSizeBytes = existsInPlc ? plcFile.NumberOfBytes : (int?)null,
-                    FileCrc32 = fileCrc,
-                    PlcCrc32 = plcCrc,
-                    DataMatches = dataMatches
-                });
-            }
-
-            // Files in PLC but not in backup
-            foreach (var plcFile in plcFiles)
+            _df1.FileProgress += progressHandler;
+            try
             {
-                if (!fileFiles.Any(f => f.FileNumber == plcFile.FileNumber && f.FileType == plcFile.FileType))
+                var plcFiles = _df1.UploadProgramData();
+                
+                _progressPercent?.Report(90);
+                _progressMessage?.Report("Comparing files…");
+
+                var comparer = EqualityComparer<PLCFileDetails>.Default;
+                var results = new List<FullCompareResult>();
+
+                foreach (var file in fileFiles)
                 {
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    
+                    var plcFile = plcFiles.FirstOrDefault(f => f.FileNumber == file.FileNumber && f.FileType == file.FileType);
+                    bool existsInPlc = !comparer.Equals(plcFile, default);
+                    bool sizeMatches = existsInPlc && plcFile.NumberOfBytes == file.NumberOfBytes;
+                    uint? fileCrc = null, plcCrc = null;
+                    bool dataMatches = false;
+
+                    if (existsInPlc && sizeMatches)
+                    {
+                        fileCrc = Crc32.Compute(file.Data);
+                        plcCrc = Crc32.Compute(plcFile.Data);
+                        dataMatches = (fileCrc == plcCrc);
+                    }
+
                     results.Add(new FullCompareResult
                     {
-                        FileNumber = plcFile.FileNumber,
-                        FileType = plcFile.FileType,
-                        FileTypeName = FileTypeHelper.GetFileTypeName(plcFile.FileType),
-                        FileExistsInFile = false,
-                        FileExistsInPlc = true,
-                        SizeMatches = false,
-                        FileSizeBytes = null,
-                        PlcSizeBytes = plcFile.NumberOfBytes,
-                        DataMatches = false
+                        FileNumber = file.FileNumber,
+                        FileType = file.FileType,
+                        FileTypeName = FileTypeHelper.GetFileTypeName(file.FileType),
+                        FileExistsInFile = true,
+                        FileExistsInPlc = existsInPlc,
+                        SizeMatches = sizeMatches,
+                        FileSizeBytes = file.NumberOfBytes,
+                        PlcSizeBytes = existsInPlc ? plcFile.NumberOfBytes : (int?)null,
+                        FileCrc32 = fileCrc,
+                        PlcCrc32 = plcCrc,
+                        DataMatches = dataMatches
                     });
                 }
-            }
 
-            return results
-                .OrderBy(r => r.FileType == 0 ? 0 : 1)                    // Directory first
-                .ThenBy(r => (r.FileType >= 0x80 && r.FileType <= 0x9F) ? 1 : 2)  // Data files next
-                .ThenBy(r => r.FileNumber)
-                .ThenBy(r => r.FileType)
-                .ToList();
-        });
+                // Files in PLC but not in backup
+                foreach (var plcFile in plcFiles)
+                {
+                    if (!fileFiles.Any(f => f.FileNumber == plcFile.FileNumber && f.FileType == plcFile.FileType))
+                    {
+                        results.Add(new FullCompareResult
+                        {
+                            FileNumber = plcFile.FileNumber,
+                            FileType = plcFile.FileType,
+                            FileTypeName = FileTypeHelper.GetFileTypeName(plcFile.FileType),
+                            FileExistsInFile = false,
+                            FileExistsInPlc = true,
+                            SizeMatches = false,
+                            FileSizeBytes = null,
+                            PlcSizeBytes = plcFile.NumberOfBytes,
+                            DataMatches = false
+                        });
+                    }
+                }
+
+                _progressPercent?.Report(100);
+                _progressMessage?.Report($"Compare complete – {fileFiles.Count} files in backup, {plcFiles.Count} files in PLC.");
+
+                return results
+                    .OrderBy(r => r.FileType == 0 ? 0 : 1)
+                    .ThenBy(r => (r.FileType >= 0x80 && r.FileType <= 0x9F) ? 1 : 2)
+                    .ThenBy(r => r.FileNumber)
+                    .ThenBy(r => r.FileType)
+                    .ToList();
+            }
+            finally
+            {
+                _df1.FileProgress -= progressHandler;
+            }
+        }, _cancellationToken);
     }
 }
