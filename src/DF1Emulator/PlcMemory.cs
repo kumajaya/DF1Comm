@@ -31,7 +31,11 @@ using System.Collections.Generic;
 ///   offset 52/53 = number of data tables   (little-endian)
 ///   offset 70/71 = total directory size in bytes
 ///   offset 79..  = file table, 10 bytes per entry:
-///                  [type, sizeWords_lo, sizeWords_hi, fileNum, attr, elemSize, addrLo, addrHi, 0, 0]
+///                  [type, sizeBytes_lo, sizeBytes_hi, fileNum, attr, elemSize, addrLo, addrHi, 0, 0]
+///
+/// IMPORTANT: The directory stores file sizes in BYTES (not words), which matches
+///            the DF1 specification where "Byte Size" fields are in bytes.
+///            See AB Publication 1770-6.5.16, page 7-17.
 ///
 /// ReadRaw: `element` parameter is a raw byte offset into the file array.
 ///          DF1Comm computes: element * bytesPerElement + subElement * 2.
@@ -40,9 +44,9 @@ using System.Collections.Generic;
 ///
 ///   File  Type  Elem  Bytes  Notes
 ///   ────  ────  ────  ─────  ─────────────────────────────────────────────
-///      0  O     2     4      Output image: O:0 (slot 4), O:1 (slot 5)
-///      1  I     7     14     Input image:  I:0–I:2 (slots 1–3), I:3–I:6 (slot 6 NI4)
-///      2  S     83    166    Status S:0–S:82; WORDS=0 in directory (system memory)
+///      0  O     2     12     Output image: O:0 (slot 4), O:1 (slot 5) — 6 words
+///      1  I     7     42     Input image:  I:0–I:2 (slots 1–3), I:3–I:6 (slot 6 NI4) — 21 words
+///      2  S     83    166    Status S:0–S:82; stored in system memory (addr not advanced)
 ///      3  B     14    28     B3:0–B3:13
 ///      4  T     78    468    T4:0–T4:77,  6 bytes/elem
 ///      5  C     1     6      C5:0,        6 bytes/elem
@@ -58,14 +62,13 @@ using System.Collections.Generic;
 ///     15  B     41    82     B15:0–B15:40
 ///     16  B     41    82     B16:0–B16:40
 ///     17  N     26    52     N17:0–N17:25
-///  18–28  —     —     —      Inactive slots (type 0x8D, size 0)
+///  18–28  —     —     —      Inactive slots
 ///     29  B     26    52     B29:0–B29:25
 ///     30  B     26    52     B30:0–B30:25
 ///     31  B     26    52     B31:0–B31:25
 ///
 /// Program files (Total=24, Active=10):
 ///   File 0–1: SYS; Files 2–23: LAD (active: 2, 3, 5, 8, 12, 15, 18, 19, 22, 23)
-///   LAD file size = rungs × 2 words (realistic estimate)
 ///
 /// Rack (1746-A7, 7 slots):
 ///   Slot 0: 1747-L532E  CPU           no I/O image
@@ -116,17 +119,19 @@ public class PlcMemory
         int pos  = 79;   // file table starts at offset 79
         int addr = 0;    // running base address in WORDS
 
-        // Write a 10-byte data file entry.
-        // sizeBytes is the actual in-memory size; stored as WORDS in the directory.
-        // S2 passes sizeBytes=0: its directory entry (type=0x84, sizeWords=0) is
-        // written normally, but addr does not advance — the status file lives in
-        // system memory and does not consume user data table address space.
+        /// <summary>
+        /// Write a 10-byte data file entry to the directory.
+        /// </summary>
+        /// <param name="type">DF1 file type code (e.g., 0x8B for O, 0x8C for I, 0x85 for B)</param>
+        /// <param name="sizeBytes">File size in BYTES (matches DF1 "Byte Size" specification)</param>
+        /// <param name="fileNum">File number (0-255)</param>
+        /// <param name="elemSize">Size of each element in bytes (default 2)</param>
         void Reg(byte type, int sizeBytes, byte fileNum, int elemSize = 2)
         {
-            int sizeWords = sizeBytes / 2;
+            // Store sizeBytes directly in BYTES (per AB Publication 1770-6.5.16 page 7-17)
             dir[pos]     = type;
-            dir[pos + 1] = (byte)(sizeWords & 0xFF);
-            dir[pos + 2] = (byte)(sizeWords >> 8);
+            dir[pos + 1] = (byte)(sizeBytes & 0xFF);
+            dir[pos + 2] = (byte)((sizeBytes >> 8) & 0xFF);
             dir[pos + 3] = fileNum;
             dir[pos + 4] = 0x00;              // attribute: normal
             dir[pos + 5] = (byte)elemSize;    // element size in bytes
@@ -134,30 +139,30 @@ public class PlcMemory
             dir[pos + 7] = (byte)(addr >> 8);
             dir[pos + 8] = 0x00;
             dir[pos + 9] = 0x00;
-            addr += sizeWords;
+            addr += sizeBytes / 2;            // addr advances in WORDS
             _fileTypeByNumber[fileNum] = type;
             pos += 10;
         }
 
         // ── Data files ───────────────────────────────────────────────────────
-        Reg(0x8B,  12,  0);       // O0  — 2 elem: 6 words from .ACH disassembly
-        Reg(0x8C,  42,  1);       // I1  — 7 elem: 21 words from .ACH disassembly
+        Reg(0x8B,  12,  0);       // O0  — 6 words = 12 bytes
+        Reg(0x8C,  42,  1);       // I1  — 21 words = 42 bytes
         Reg(0x84,   0,  2);       // S2  — system memory, no user address space
-        Reg(0x85,  28,  3);       // B3  — 14 words
-        Reg(0x86, 468,  4, 6);    // T4  — 78 elem × 6 bytes
-        Reg(0x87,   6,  5, 6);    // C5  — 1 elem  × 6 bytes
-        Reg(0x88,  12,  6, 6);    // R6  — 2 elem  × 6 bytes
-        Reg(0x89, 148,  7);       // N7  — 74 words
-        Reg(0x8A, 152,  8, 4);    // F8  — 38 elem × 4 bytes
-        Reg(0x85,  20,  9);       // B9  — 10 words
-        Reg(0x85, 142, 10);       // B10 — 71 words
-        Reg(0x85,  18, 11);       // B11 — 9 words
-        Reg(0x85,   2, 12);       // B12 — 1 word
-        Reg(0x85,   4, 13);       // B13 — 2 words
-        Reg(0x85,   2, 14);       // B14 — 1 word
-        Reg(0x85,  82, 15);       // B15 — 41 words
-        Reg(0x85,  82, 16);       // B16 — 41 words
-        Reg(0x89,  52, 17);       // N17 — 26 words
+        Reg(0x85,  28,  3);       // B3  — 14 words = 28 bytes
+        Reg(0x86, 468,  4, 6);    // T4  — 78 timers × 6 bytes = 468 bytes
+        Reg(0x87,   6,  5, 6);    // C5  — 1 counter × 6 bytes = 6 bytes
+        Reg(0x88,  12,  6, 6);    // R6  — 2 controls × 6 bytes = 12 bytes
+        Reg(0x89, 148,  7);       // N7  — 74 words = 148 bytes
+        Reg(0x8A, 152,  8, 4);    // F8  — 38 floats × 4 bytes = 152 bytes
+        Reg(0x85,  20,  9);       // B9  — 10 words = 20 bytes
+        Reg(0x85, 142, 10);       // B10 — 71 words = 142 bytes
+        Reg(0x85,  18, 11);       // B11 — 9 words = 18 bytes
+        Reg(0x85,   2, 12);       // B12 — 1 word = 2 bytes
+        Reg(0x85,   4, 13);       // B13 — 2 words = 4 bytes
+        Reg(0x85,   2, 14);       // B14 — 1 word = 2 bytes
+        Reg(0x85,  82, 15);       // B15 — 41 words = 82 bytes
+        Reg(0x85,  82, 16);       // B16 — 41 words = 82 bytes
+        Reg(0x89,  52, 17);       // N17 — 26 words = 52 bytes
 
         // Files 18–28: inactive slots (type 0x85 = Binary, size 0).
         // RSLogix shows Total Files=32, Active Files=21; these occupy directory
@@ -172,12 +177,12 @@ public class PlcMemory
             pos += 10;
         }
 
-        Reg(0x85, 52, 29);        // B29 — 26 words
-        Reg(0x85, 52, 30);        // B30 — 26 words
-        Reg(0x85, 52, 31);        // B31 — 26 words
+        Reg(0x85, 52, 29);        // B29 — 26 words = 52 bytes
+        Reg(0x85, 52, 30);        // B30 — 26 words = 52 bytes
+        Reg(0x85, 52, 31);        // B31 — 26 words = 52 bytes
 
         // ── Program files ────────────────────────────────────────────────────
-        // Actual size per LAD file (in bytes form .ACH disassembly)
+        // Actual size per LAD file from .ACH disassembly (bytes)
         var actualLadSizes = new Dictionary<int, int>
         {
             {2, 757},   // LAD 2: 757 bytes
@@ -193,16 +198,18 @@ public class PlcMemory
         };
         int[] activeLad = { 2, 3, 5, 8, 12, 15, 18, 19, 22, 23 };
 
-        // SYS file 0
+        // SYS file 0 (2 bytes)
         dir[pos]     = 0x01;
-        dir[pos + 1] = 0x01;   // size = 1 word
+        dir[pos + 1] = 0x02;   // 2 bytes
+        dir[pos + 2] = 0x00;
         dir[pos + 3] = 0x00;
         pos += 10;
         _fileTypeByNumber[0] = 0x01;
 
-        // SYS file 1
+        // SYS file 1 (2 bytes)
         dir[pos]     = 0x01;
-        dir[pos + 1] = 0x01;   // size = 1 word
+        dir[pos + 1] = 0x02;   // 2 bytes
+        dir[pos + 2] = 0x00;
         dir[pos + 3] = 0x01;
         pos += 10;
         _fileTypeByNumber[1] = 0x01;
@@ -212,29 +219,32 @@ public class PlcMemory
         {
             bool active = Array.IndexOf(activeLad, n) >= 0;
             int sizeBytes = 0;
-            int sizeWords = 0;
-            // Use FileType in the range 0x20-0x3F
             byte fileType = (byte)(0x20 + (n - 2));
             
             if (active && actualLadSizes.ContainsKey(n))
             {
                 sizeBytes = actualLadSizes[n];
-                sizeWords = (sizeBytes + 1) / 2;  // round up to even word
+                // Allocate storage for active LAD logic
+                _files[(fileType, n)] = new byte[sizeBytes];
+                _bytesPerElement[(fileType, n)] = 0;
+                _fileTypeByNumber[n] = fileType;
+            }
+            else
+            {
+                // Inactive LAD file: no storage allocation, but directory entry exists
+                _fileTypeByNumber[n] = fileType;
             }
             
+            // Directory entry stores size in BYTES (per AB specification)
             dir[pos]     = fileType;
-            dir[pos + 1] = (byte)(sizeWords & 0xFF);
-            dir[pos + 2] = (byte)((sizeWords >> 8) & 0xFF);
+            dir[pos + 1] = (byte)(sizeBytes & 0xFF);
+            dir[pos + 2] = (byte)((sizeBytes >> 8) & 0xFF);
             dir[pos + 3] = (byte)n;
             // bytes 4–9 remain zero
             pos += 10;
-
-            _fileTypeByNumber[n] = fileType;
-            // Allocate storage for ladder logic (used when writing to program files)
-            _files[(fileType, n)] = new byte[sizeWords * 2];
-            _bytesPerElement[(fileType, n)] = 0;
         }
 
+        // Store the directory itself as File 0
         _files[(1, 0)] = dir;
     }
 
@@ -244,19 +254,18 @@ public class PlcMemory
 
     private void BuildDataFiles()
     {
-        // ── O0 — Output image (2 elem = 4 bytes) ─────────────────────────────
-        // O:0 = slot 4 (1746-OB16), O:1 = slot 5 (1746-OB16). Last address: O:1.
-        _files[(0x8B, 0)]          = new byte[12]; // 6 words from .ACH disassembly
+        // ── O0 — Output image (6 words = 12 bytes) ───────────────────────────
+        // O:0 = slot 4 (1746-OB16), O:1 = slot 5 (1746-OB16)
+        _files[(0x8B, 0)]          = new byte[12];
         _bytesPerElement[(0x8B, 0)] = 2;
 
-        // ── I1 — Input image (7 elem = 14 bytes) ─────────────────────────────
-        // I:0–I:2 = slots 1–3 (1746-IB16 × 3), I:3–I:6 = slot 6 (1746-NI4, 4 ch).
-        // Last address: I:6.
-        _files[(0x8C, 1)]          = new byte[42]; // 21 words from .ACH disassembly
+        // ── I1 — Input image (21 words = 42 bytes) ───────────────────────────
+        // I:0–I:2 = slots 1–3 (1746-IB16 × 3), I:3–I:6 = slot 6 (1746-NI4, 4 ch)
+        _files[(0x8C, 1)]          = new byte[42];
         _bytesPerElement[(0x8C, 1)] = 2;
 
-        // ── S2 — Status (83 elem = 166 bytes, S:0–S:82) ──────────────────────
-        // WORDS=0 in directory: system memory, not counted in user Total Memory.
+        // ── S2 — Status (83 words = 166 bytes, S:0–S:82) ─────────────────────
+        // System memory, not counted in user Total Memory
         _files[(0x84, 2)]          = new byte[166];
         _bytesPerElement[(0x84, 2)] = 2;
         ushort[] s2 =
@@ -288,15 +297,15 @@ public class PlcMemory
         WriteU16(_files[(0x85, 3)], 0, 0xAA55);
         WriteU16(_files[(0x85, 3)], 2, 0x0FF0);
 
-        // ── T4 — Timer (78 elem × 6 bytes = 468 bytes) ───────────────────────
+        // ── T4 — Timer (78 timers × 6 bytes = 468 bytes) ─────────────────────
         _files[(0x86, 4)]          = new byte[468];
         _bytesPerElement[(0x86, 4)] = 6;
 
-        // ── C5 — Counter (1 elem × 6 bytes) ──────────────────────────────────
+        // ── C5 — Counter (1 counter × 6 bytes = 6 bytes) ────────────────────
         _files[(0x87, 5)]          = new byte[6];
         _bytesPerElement[(0x87, 5)] = 6;
 
-        // ── R6 — Control (2 elem × 6 bytes = 12 bytes) ───────────────────────
+        // ── R6 — Control (2 controls × 6 bytes = 12 bytes) ───────────────────
         _files[(0x88, 6)]          = new byte[12];
         _bytesPerElement[(0x88, 6)] = 6;
 
@@ -307,25 +316,25 @@ public class PlcMemory
         WriteU16(_files[(0x89, 7)],  2,   456);
         WriteU16(_files[(0x89, 7)],  4, -789);
 
-        // ── F8 — Float (38 elem × 4 bytes = 152 bytes) ───────────────────────
+        // ── F8 — Float (38 floats × 4 bytes = 152 bytes) ─────────────────────
         _files[(0x8A, 8)]          = new byte[152];
         _bytesPerElement[(0x8A, 8)] = 4;
         Array.Copy(BitConverter.GetBytes(1.23f), 0, _files[(0x8A, 8)], 0, 4);
         Array.Copy(BitConverter.GetBytes(4.56f), 0, _files[(0x8A, 8)], 4, 4);
 
         // ── B9–B16, N17, B29–B31 ─────────────────────────────────────────────
-        CreateDataFile(0x85,  9,  20, 2);   // B9  — 10 words
-        CreateDataFile(0x85, 10, 142, 2);   // B10 — 71 words
-        CreateDataFile(0x85, 11,  18, 2);   // B11 — 9 words
-        CreateDataFile(0x85, 12,   2, 2);   // B12 — 1 word
-        CreateDataFile(0x85, 13,   4, 2);   // B13 — 2 words
-        CreateDataFile(0x85, 14,   2, 2);   // B14 — 1 word
-        CreateDataFile(0x85, 15,  82, 2);   // B15 — 41 words
-        CreateDataFile(0x85, 16,  82, 2);   // B16 — 41 words
-        CreateDataFile(0x89, 17,  52, 2);   // N17 — 26 words
-        CreateDataFile(0x85, 29,  52, 2);   // B29 — 26 words
-        CreateDataFile(0x85, 30,  52, 2);   // B30 — 26 words
-        CreateDataFile(0x85, 31,  52, 2);   // B31 — 26 words
+        CreateDataFile(0x85,  9,  20, 2);   // B9  — 10 words = 20 bytes
+        CreateDataFile(0x85, 10, 142, 2);   // B10 — 71 words = 142 bytes
+        CreateDataFile(0x85, 11,  18, 2);   // B11 — 9 words = 18 bytes
+        CreateDataFile(0x85, 12,   2, 2);   // B12 — 1 word = 2 bytes
+        CreateDataFile(0x85, 13,   4, 2);   // B13 — 2 words = 4 bytes
+        CreateDataFile(0x85, 14,   2, 2);   // B14 — 1 word = 2 bytes
+        CreateDataFile(0x85, 15,  82, 2);   // B15 — 41 words = 82 bytes
+        CreateDataFile(0x85, 16,  82, 2);   // B16 — 41 words = 82 bytes
+        CreateDataFile(0x89, 17,  52, 2);   // N17 — 26 words = 52 bytes
+        CreateDataFile(0x85, 29,  52, 2);   // B29 — 26 words = 52 bytes
+        CreateDataFile(0x85, 30,  52, 2);   // B30 — 26 words = 52 bytes
+        CreateDataFile(0x85, 31,  52, 2);   // B31 — 26 words = 52 bytes
     }
 
     // =========================================================================

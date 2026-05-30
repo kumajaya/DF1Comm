@@ -745,7 +745,7 @@ namespace DF1Comm
                 int tempPos = filePosition;
                 for (int j = 0; j < totalEntries && tempPos < fzd.Length; j++)
                 {
-                    int sizeBytes = (fzd[tempPos + 1] + fzd[tempPos + 2] * 256) * 2;
+                    int sizeBytes = fzd[tempPos + 1] + fzd[tempPos + 2] * 256;
                     grandTotalBytes += sizeBytes;
                     tempPos += (ProcessorType == 0x25 || ProcessorType == 0x58) ? 8 : 10;
                 }
