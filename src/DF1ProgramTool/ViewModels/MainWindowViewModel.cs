@@ -9,12 +9,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Avalonia;
-using Avalonia.Controls;
-using Avalonia.Controls.ApplicationLifetimes;
-using Avalonia.Data;
-using Avalonia.Layout;
-using Avalonia.Media;
 using DF1Comm;
 using DF1ProgramTool.Models;
 using DF1ProgramTool.Services;
@@ -49,6 +43,12 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     private decimal _targetNode      = 1;
     private decimal _myNode          = 0;
     private string  _logText         = string.Empty;
+
+    // ─── Log throttling fields ──────────────────────────────────────────────
+    private readonly StringBuilder _pendingLogBatch = new();
+    private readonly object _logBatchLock = new();
+    private DateTime _lastLogFlush = DateTime.MinValue;
+    private const int LogFlushIntervalMs = 50;  // Max 20 updates per second
 
     // ─── Observable collections ───────────────────────────────────────────────
     public ObservableCollection<string> AvailablePorts { get; } = new();
@@ -206,52 +206,64 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     // ─── Logging ─────────────────────────────────────────────────────────────
     private void AppendLog(string line)
     {
-        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        lock (_logBatchLock)
         {
-            // Remove oldest line if buffer exceeds max allowed lines
-            if (_logLineCount >= MaxLogLines)
-            {
-                string s = _logBuffer.ToString();
-                int nl = s.IndexOf('\n');
-                if (nl >= 0)
-                    _logBuffer.Remove(0, nl + 1);
-                else
-                    _logBuffer.Clear();
-                _logLineCount--;
-            }
-
-            string timeStamp = DateTime.Now.ToString("HH:mm:ss.fff");
-            _logBuffer.Append(timeStamp);
-            _logBuffer.Append("  ");
-
-            // If line contains a newline (TX/RX + decoded payload), indent the second line
-            if (line.Contains('\n'))
-            {
-                int idx = line.IndexOf('\n');
-                string firstLine = line.Substring(0, idx);
-                string secondLine = line.Substring(idx + 1);
-                _logBuffer.AppendLine(firstLine);
-                // Indent second line to align with text after timestamp
-                _logBuffer.Append(new string(' ', timeStamp.Length + 2));
-                _logBuffer.Append(secondLine);
-                _logBuffer.AppendLine();
-                _logLineCount += 2;
-            }
-            else
-            {
-                _logBuffer.AppendLine(line);
-                _logLineCount++;
-            }
-
-            LogText = _logBuffer.ToString();
-        });
+            _pendingLogBatch.AppendLine($"{DateTime.Now:HH:mm:ss.fff}  {line}");
+        }
+        
+        // Throttle: flush only if enough time has passed or batch is getting large
+        if ((DateTime.Now - _lastLogFlush).TotalMilliseconds >= LogFlushIntervalMs || 
+            _pendingLogBatch.Length > 2000)
+        {
+            FlushPendingLogs();
+        }
     }
 
     private void ClearLog()
     {
+        // Flush any pending logs first
+        FlushPendingLogs();
+        
         _logBuffer.Clear();
         _logLineCount = 0;
         LogText = string.Empty;
+        
+        lock (_logBatchLock)
+        {
+            _pendingLogBatch.Clear();
+        }
+    }
+
+    private void FlushPendingLogs()
+    {
+        string batch;
+        lock (_logBatchLock)
+        {
+            if (_pendingLogBatch.Length == 0) return;
+            batch = _pendingLogBatch.ToString();
+            _pendingLogBatch.Clear();
+        }
+        
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            _logBuffer.Append(batch);
+            _logLineCount += batch.Count(c => c == '\n');
+            
+            // Trim if exceeding max lines
+            while (_logLineCount > MaxLogLines)
+            {
+                string current = _logBuffer.ToString();
+                int idx = current.IndexOf('\n');
+                if (idx >= 0)
+                    _logBuffer.Remove(0, idx + 1);
+                else
+                    _logBuffer.Clear();
+                _logLineCount--;
+            }
+            
+            LogText = _logBuffer.ToString();
+            _lastLogFlush = DateTime.Now;
+        });
     }
 
     /// <summary>
@@ -260,6 +272,10 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
     /// </summary>
     private async Task FlushLogsAsync()
     {
+        // Flush any pending log batches
+        FlushPendingLogs();
+        
+        // Wait for UI thread to process all queued operations
         await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => { });
     }
 
@@ -501,11 +517,11 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             await work(progressMsg, progressPct, _cts.Token);
             AppendLog($"--- {operationName} complete ---");
             await RefreshPlcStatusAsync();
-            await FlushLogsAsync();  // Ensure completion logs are rendered
+            await FlushLogsAsync();  // Ensure all logs are rendered
             
             if (operationName == "Download")
             {
-                await FlushLogsAsync();  // Additional flush before confirmation dialog
+                await FlushLogsAsync();  // Extra flush before confirmation dialog
                 bool switchToRun = await _dialogService.ShowConfirmAsync(
                     "Download Complete",
                     "Download finished successfully.\n\nSwitch to RUN mode now?");
