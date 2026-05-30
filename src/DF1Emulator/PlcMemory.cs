@@ -19,6 +19,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+//#define INCLUDE_INACTIVE_FILES // Comment out to exclude inactive files
 using System;
 using System.Collections.Generic;
 
@@ -109,12 +110,20 @@ public class PlcMemory
         //       The 714 words is the sum of user data table words (O, I, B, N, F, T, C, R files)
         //       which is calculated from sizeBytes of each data file registered below.
         //
+#if INCLUDE_INACTIVE_FILES
         const int dirSize = 639;
+        const int numProgramFiles = 24;  // SYS×2 + LAD×22
+        const int numDataFiles = 32;     // 32 data file slots
+#else
+        const int dirSize = 409;         // 79 + (33 × 10)
+        const int numProgramFiles = 12;  // SYS×2 + LAD×10
+        const int numDataFiles = 21;     // 21 data files aktif
+#endif
         var dir = new byte[dirSize];
 
         WriteU16(dir, 70, dirSize); // directory size at offset 70 (element 0x23 × 2)
-        WriteU16(dir, 46, 24);      // 24 program files: SYS×2 + LAD×22
-        WriteU16(dir, 52, 32);      // 32 data file slots
+        WriteU16(dir, 46, numProgramFiles);
+        WriteU16(dir, 52, numDataFiles);
 
         int pos  = 79;   // file table starts at offset 79
         int addr = 0;    // running base address in WORDS
@@ -164,6 +173,7 @@ public class PlcMemory
         Reg(0x85,  82, 16);       // B16 — 41 words = 82 bytes
         Reg(0x89,  52, 17);       // N17 — 26 words = 52 bytes
 
+#if INCLUDE_INACTIVE_FILES
         // Files 18–28: inactive slots (type 0x85 = Binary, size 0).
         // RSLogix shows Total Files=32, Active Files=21; these occupy directory
         // slots but have no data and do not appear in RSLogix file lists.
@@ -176,6 +186,7 @@ public class PlcMemory
             // bytes 4–9 all zero
             pos += 10;
         }
+#endif
 
         Reg(0x85, 52, 29);        // B29 — 26 words = 52 bytes
         Reg(0x85, 52, 30);        // B30 — 26 words = 52 bytes
@@ -214,6 +225,7 @@ public class PlcMemory
         pos += 10;
         _fileTypeByNumber[1] = 0x01;
 
+#if INCLUDE_INACTIVE_FILES
         // LAD files 2–23
         for (int n = 2; n <= 23; n++)
         {
@@ -243,6 +255,26 @@ public class PlcMemory
             // bytes 4–9 remain zero
             pos += 10;
         }
+#else
+        int typeIndex = 0;
+        foreach (int n in activeLad)
+        {
+            int sizeBytes = actualLadSizes[n];
+            byte fileType = (byte)(0x20 + typeIndex);
+            
+            _files[(fileType, n)] = new byte[sizeBytes];
+            _bytesPerElement[(fileType, n)] = 0;
+            _fileTypeByNumber[n] = fileType;
+            
+            dir[pos]     = fileType;
+            dir[pos + 1] = (byte)(sizeBytes & 0xFF);
+            dir[pos + 2] = (byte)((sizeBytes >> 8) & 0xFF);
+            dir[pos + 3] = (byte)n;
+            pos += 10;
+            
+            typeIndex++;
+        }
+#endif
 
         // Store the directory itself as File 0
         _files[(1, 0)] = dir;
