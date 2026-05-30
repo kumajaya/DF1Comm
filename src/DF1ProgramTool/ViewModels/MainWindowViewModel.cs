@@ -254,6 +254,15 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
         LogText = string.Empty;
     }
 
+    /// <summary>
+    /// Waits for all pending UI thread operations (including log updates) to complete.
+    /// Call this before showing dialogs to ensure logs are fully rendered.
+    /// </summary>
+    private async Task FlushLogsAsync()
+    {
+        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => { });
+    }
+
     // ─── About ───────────────────────────────────────────────────────────────
     private async void ShowAbout()
     {
@@ -492,9 +501,12 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
             await work(progressMsg, progressPct, _cts.Token);
             AppendLog($"--- {operationName} complete ---");
             await RefreshPlcStatusAsync();
+            await FlushLogsAsync();  // Ensure completion logs are rendered
+            
             if (operationName == "Download")
             {
-                 bool switchToRun = await _dialogService.ShowConfirmAsync(
+                await FlushLogsAsync();  // Additional flush before confirmation dialog
+                bool switchToRun = await _dialogService.ShowConfirmAsync(
                     "Download Complete",
                     "Download finished successfully.\n\nSwitch to RUN mode now?");
                 
@@ -516,17 +528,21 @@ public class MainWindowViewModel : ReactiveObject, IDisposable
                     AppendLog("PLC remains in PROGRAM mode.");
                 }
             }
+            
+            await FlushLogsAsync();  // Flush before success dialog
             await _dialogService.ShowMessageAsync($"{operationName} Complete",
                 $"{operationName} finished successfully.");
         }
         catch (OperationCanceledException)
         {
             AppendLog($"--- {operationName} cancelled ---");
+            await FlushLogsAsync();
             await _dialogService.ShowMessageAsync("Cancelled", $"{operationName} was cancelled.");
         }
         catch (Exception ex)
         {
             AppendLog($"ERROR: {ex.Message}");
+            await FlushLogsAsync();
             await _dialogService.ShowMessageAsync($"{operationName} Error", ex.Message);
         }
         finally

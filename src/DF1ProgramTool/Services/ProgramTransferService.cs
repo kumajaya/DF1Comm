@@ -326,7 +326,12 @@ public class ProgramTransferService
                 }
             }
 
-            return results.OrderBy(r => r.FileNumber).ThenBy(r => r.FileType).ToList();
+            return results
+                .OrderBy(r => r.FileType == 0 ? 0 : 1)                    // Directory first
+                .ThenBy(r => (r.FileType >= 0x80 && r.FileType <= 0x9F) ? 1 : 2)  // Data files next
+                .ThenBy(r => r.FileNumber)
+                .ThenBy(r => r.FileType)
+                .ToList();
         });
     }
 }
