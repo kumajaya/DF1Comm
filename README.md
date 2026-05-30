@@ -91,6 +91,7 @@ DF1Comm/
 - Cross‑platform GUI built with Avalonia UI
 - Upload entire PLC program to a binary file
 - Download previously saved program back to the PLC
+- Compares a backup file against current PLC program
 - Supports SLC 5/01–5/05 and MicroLogix 1000/1500
 - Automatic PLC detection and descriptive filename generation
 - Progress indication during transfer

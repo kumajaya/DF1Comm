@@ -14,6 +14,7 @@ Cross‑platform desktop GUI (Avalonia UI) that uploads the complete program fro
 - Automatic **PLC detection** – processor type, family, and run/program mode.
 - **Upload** – reads all program and data files, saves to a compact binary file (`.bin`) with a descriptive name.
 - **Download** – restores a previously uploaded program to the same PLC family.
+- **Compare** – compares a backup file against current PLC program, shows mismatches in file structure and CRC32 data.
 - **Supports** SLC 5/01, 5/02, 5/03, 5/04, 5/05 and MicroLogix 1000/1500.
 - **Graphical COM port selection** – baud rate, parity, and node address configurable.
 - **Progress indication** – shows current file being transferred.
@@ -24,7 +25,11 @@ Cross‑platform desktop GUI (Avalonia UI) that uploads the complete program fro
 
 ![Main Window](Assets/Screenshots/MainWindow.png)
 
-*Main window after uploading DF1Emulator internal memory*
+*Main window after downloading DF1Emulator internal memory*
+
+![Compare Results](Assets/Screenshots/CompareResults.png)
+
+*Compare dialog showing differences between backup file and PLC memory*
 
 ## Requirements
 - .NET 8 SDK or later
@@ -124,6 +129,7 @@ During download, the tool validates the processor type and bulletin against the 
 | **Invalid Address** during download | The selected binary file does not match the target PLC memory layout (different processor family). |
 | **Dialog hangs / no reaction** | Run from a terminal to see debug output; ensure the main window is not hidden. |
 | **PLC stopped working after download** | You downloaded a program file that is not compatible with your PLC. Restore the original backup using RSLogix or this tool if a correct backup exists. |
+| **Compare shows mismatches** | Normal if the PLC program has changed since the backup was created. Use Upload to create a fresh backup. |
 
 ## Project structure
 | File | Description |
