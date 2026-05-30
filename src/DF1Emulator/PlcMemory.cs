@@ -140,8 +140,8 @@ public class PlcMemory
         }
 
         // ── Data files ───────────────────────────────────────────────────────
-        Reg(0x8B,   4,  0);       // O0  — 2 elem × 2 bytes
-        Reg(0x8C,  14,  1);       // I1  — 7 elem × 2 bytes
+        Reg(0x8B,  12,  0);       // O0  — 2 elem: 6 words from .ACH disassembly
+        Reg(0x8C,  42,  1);       // I1  — 7 elem: 21 words from .ACH disassembly
         Reg(0x84,   0,  2);       // S2  — system memory, no user address space
         Reg(0x85,  28,  3);       // B3  — 14 words
         Reg(0x86, 468,  4, 6);    // T4  — 78 elem × 6 bytes
@@ -177,14 +177,21 @@ public class PlcMemory
         Reg(0x85, 52, 31);        // B31 — 26 words
 
         // ── Program files ────────────────────────────────────────────────────
-        // Rung counts per file from baseline, with realistic size: 2 words per rung
-        var rungs = new Dictionary<int, int>
+        // Actual size per LAD file (in bytes form .ACH disassembly)
+        var actualLadSizes = new Dictionary<int, int>
         {
-            {2, 23}, {3, 13}, {5, 24}, {8, 26}, {12, 16},
-            {15, 22}, {18, 18}, {19, 6}, {22, 14}, {23, 9}
+            {2, 757},   // LAD 2: 757 bytes
+            {3, 486},   // LAD 3: 486 bytes
+            {5, 972},   // LAD 5: 972 bytes
+            {8, 646},   // LAD 8: 646 bytes
+            {12, 1440}, // LAD 12: 1440 bytes
+            {15, 824},  // LAD 15: 824 bytes
+            {18, 646},  // LAD 18: 646 bytes
+            {19, 225},  // LAD 19: 225 bytes
+            {22, 903},  // LAD 22: 903 bytes
+            {23, 416},  // LAD 23: 416 bytes
         };
         int[] activeLad = { 2, 3, 5, 8, 12, 15, 18, 19, 22, 23 };
-        const int wordsPerRung = 2;   // realistic estimate: 2 words per rung
 
         // SYS file 0
         dir[pos]     = 0x01;
@@ -204,10 +211,16 @@ public class PlcMemory
         for (int n = 2; n <= 23; n++)
         {
             bool active = Array.IndexOf(activeLad, n) >= 0;
-            int sizeWords = active ? rungs[n] * wordsPerRung : 0;
-            
+            int sizeBytes = 0;
+            int sizeWords = 0;
             // Use FileType in the range 0x20-0x3F
             byte fileType = (byte)(0x20 + (n - 2));
+            
+            if (active && actualLadSizes.ContainsKey(n))
+            {
+                sizeBytes = actualLadSizes[n];
+                sizeWords = (sizeBytes + 1) / 2;  // round up to even word
+            }
             
             dir[pos]     = fileType;
             dir[pos + 1] = (byte)(sizeWords & 0xFF);
@@ -233,13 +246,13 @@ public class PlcMemory
     {
         // ── O0 — Output image (2 elem = 4 bytes) ─────────────────────────────
         // O:0 = slot 4 (1746-OB16), O:1 = slot 5 (1746-OB16). Last address: O:1.
-        _files[(0x8B, 0)]          = new byte[4];
+        _files[(0x8B, 0)]          = new byte[12]; // 6 words from .ACH disassembly
         _bytesPerElement[(0x8B, 0)] = 2;
 
         // ── I1 — Input image (7 elem = 14 bytes) ─────────────────────────────
         // I:0–I:2 = slots 1–3 (1746-IB16 × 3), I:3–I:6 = slot 6 (1746-NI4, 4 ch).
         // Last address: I:6.
-        _files[(0x8C, 1)]          = new byte[14];
+        _files[(0x8C, 1)]          = new byte[42]; // 21 words from .ACH disassembly
         _bytesPerElement[(0x8C, 1)] = 2;
 
         // ── S2 — Status (83 elem = 166 bytes, S:0–S:82) ──────────────────────
