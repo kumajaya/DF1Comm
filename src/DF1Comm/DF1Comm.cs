@@ -107,6 +107,7 @@ namespace DF1Comm
         public event EventHandler? AutoDetectTry;
         public event EventHandler? DownloadProgress;
         public event EventHandler? UploadProgress;
+        public event EventHandler<FileProgressEventArgs>? FileProgress;
 
         // Events for logging support
         public event EventHandler<byte[]>? RawFrameSent
@@ -130,6 +131,33 @@ namespace DF1Comm
         {
             get => responseTimeoutMs;
             set => responseTimeoutMs = value > 0 ? value : 2000;
+        }
+
+        /// <summary>
+        /// Event arguments for file progress during upload/download operations.
+        /// </summary>
+        public class FileProgressEventArgs : EventArgs
+        {
+            /// <summary>File number being processed (0-255)</summary>
+            public int FileNumber { get; set; }
+            
+            /// <summary>File type code (0x01=SYS, 0x20-0x3F=LAD, 0x80-0x9F=Data)</summary>
+            public int FileType { get; set; }
+            
+            /// <summary>Size of the file in bytes</summary>
+            public int FileSizeBytes { get; set; }
+            
+            /// <summary>Number of files completed so far</summary>
+            public int FilesCompleted { get; set; }
+            
+            /// <summary>Total number of files to process</summary>
+            public int TotalFiles { get; set; }
+            
+            /// <summary>Total bytes transferred so far</summary>
+            public long TotalBytesTransferred { get; set; }
+            
+            /// <summary>Grand total bytes for all files</summary>
+            public long GrandTotalBytes { get; set; }
         }
 
         // ─── Constructor ─────────────────────────────────────────────────────────
@@ -692,6 +720,18 @@ namespace DF1Comm
                 programFiles.Add(new PLCFileDetails { FileNumber = 0, Data = fzd, FileType = 0, NumberOfBytes = fzd.Length });
                 UploadProgress?.Invoke(this, EventArgs.Empty);
 
+                // Fire FileProgress for directory
+                FileProgress?.Invoke(this, new FileProgressEventArgs
+                {
+                    FileNumber = 0,
+                    FileType = 0,
+                    FileSizeBytes = fzd.Length,
+                    FilesCompleted = 1,
+                    TotalFiles = 1,
+                    TotalBytesTransferred = fzd.Length,
+                    GrandTotalBytes = fzd.Length
+                });
+
                 int numberOfProgramFiles = fzd[46] + fzd[47] * 256;
                 int numberOfDataFiles = fzd[52] + fzd[53] * 256;
                 int totalEntries = numberOfProgramFiles + numberOfDataFiles;
@@ -702,7 +742,23 @@ namespace DF1Comm
 
                 // ORIGINAL CODE: kept for reference but no longer used
                 // int dfg = 0, ffg = 0, sfg = 0, slfg = 0, lfg = 0, u1 = 0, u2 = 0;
+
+                // First pass: calculate grand total bytes
+                long grandTotalBytes = 0;
+                int tempPos = filePosition;
+                for (int j = 0; j < totalEntries && tempPos < fzd.Length; j++)
+                {
+                    int sizeBytes = (fzd[tempPos + 1] + fzd[tempPos + 2] * 256) * 2;
+                    grandTotalBytes += sizeBytes;
+                    tempPos += (ProcessorType == 0x25 || ProcessorType == 0x58) ? 8 : 10;
+                }
+                // Add directory size
+                grandTotalBytes += fzd.Length;
+
                 int i = 0;
+                long totalBytesTransferred = fzd.Length;  // Start with directory
+                int filesCompleted = 1;                    // Directory counted
+
                 while (filePosition < fzd.Length && i < totalEntries)
                 {
                     var pf = new PLCFileDetails
@@ -739,6 +795,23 @@ namespace DF1Comm
                     else pf.Data = Array.Empty<byte>();
 
                     programFiles.Add(pf);
+
+                    // Update progress
+                    totalBytesTransferred += pf.NumberOfBytes;
+                    filesCompleted++;
+
+                    // Fire FileProgress event
+                    FileProgress?.Invoke(this, new FileProgressEventArgs
+                    {
+                        FileNumber = pf.FileNumber,
+                        FileType = pf.FileType,
+                        FileSizeBytes = pf.NumberOfBytes,
+                        FilesCompleted = filesCompleted,
+                        TotalFiles = totalEntries + 1,  // +1 for directory
+                        TotalBytesTransferred = totalBytesTransferred,
+                        GrandTotalBytes = grandTotalBytes
+                    });
+
                     UploadProgress?.Invoke(this, EventArgs.Empty);
                     i++;
                     filePosition += (ProcessorType == 0x25 || ProcessorType == 0x58) ? 8 : 10;
@@ -759,6 +832,12 @@ namespace DF1Comm
             {
                 SetProgramMode();
                 DownloadProgress?.Invoke(this, EventArgs.Empty);
+
+                // Calculate grand total bytes
+                long grandTotalBytes = plcFiles.Sum(f => f.Data?.Length ?? 0);
+                long totalBytesTransferred = 0;
+                int filesCompleted = 0;
+                int totalFiles = plcFiles.Count;
 
                 int dataLength = (ProcessorType == 0x5B || ProcessorType == 0x78) ? 13 : 15;
                 byte[] data = new byte[dataLength + 1];
@@ -817,20 +896,66 @@ namespace DF1Comm
                 byte[] data3 = { (byte)(plcFiles[0].Data.Length & 0xFF), (byte)((plcFiles[0].Data.Length >> 8) & 0xFF) };
                 reply = WriteRawData(pAddr, 2, data3);
                 if (reply != 0) throw new DF1Exception("Failed to Write Directory Length - " + MessageDecoder.DecodeMessage(reply));
+
+                // Fire progress for directory length write
+                totalBytesTransferred += 2;
+                filesCompleted = 1;
+                FileProgress?.Invoke(this, new FileProgressEventArgs
+                {
+                    FileNumber = 0,
+                    FileType = 0,
+                    FileSizeBytes = 2,
+                    FilesCompleted = filesCompleted,
+                    TotalFiles = totalFiles,
+                    TotalBytesTransferred = totalBytesTransferred,
+                    GrandTotalBytes = grandTotalBytes
+                });
                 DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 pAddr.Element = 0;
                 reply = WriteRawData(pAddr, plcFiles[0].Data.Length, plcFiles[0].Data);
                 if (reply != 0) throw new DF1Exception("Failed to Write New Program Directory - " + MessageDecoder.DecodeMessage(reply));
+
+                // Fire progress for directory data write
+                totalBytesTransferred += plcFiles[0].Data.Length;
+                filesCompleted++;
+                FileProgress?.Invoke(this, new FileProgressEventArgs
+                {
+                    FileNumber = 0,
+                    FileType = 0,
+                    FileSizeBytes = plcFiles[0].Data.Length,
+                    FilesCompleted = filesCompleted,
+                    TotalFiles = totalFiles,
+                    TotalBytesTransferred = totalBytesTransferred,
+                    GrandTotalBytes = grandTotalBytes
+                });
                 DownloadProgress?.Invoke(this, EventArgs.Empty);
 
                 for (int i = 1; i < plcFiles.Count; i++)
                 {
-                    pAddr.FileNumber = plcFiles[i].FileNumber; pAddr.FileType = plcFiles[i].FileType;
-                    pAddr.Element = 0; pAddr.SubElement = 0;
+                    pAddr.FileNumber = plcFiles[i].FileNumber;
+                    pAddr.FileType = plcFiles[i].FileType;
+                    pAddr.Element = 0;
+                    pAddr.SubElement = 0;
                     pAddr.BitNumber = 16;
+
                     reply = WriteRawData(pAddr, plcFiles[i].Data.Length, plcFiles[i].Data);
                     if (reply != 0) throw new DF1Exception("Failed when writing files to PLC - " + MessageDecoder.DecodeMessage(reply));
+
+                    // Fire progress for each file
+                    totalBytesTransferred += plcFiles[i].Data?.Length ?? 0;
+                    filesCompleted++;
+                    FileProgress?.Invoke(this, new FileProgressEventArgs
+                    {
+                        FileNumber = plcFiles[i].FileNumber,
+                        FileType = plcFiles[i].FileType,
+                        FileSizeBytes = plcFiles[i].Data?.Length ?? 0,
+                        FilesCompleted = filesCompleted,
+                        TotalFiles = totalFiles,
+                        TotalBytesTransferred = totalBytesTransferred,
+                        GrandTotalBytes = grandTotalBytes
+                    });
+
                     DownloadProgress?.Invoke(this, EventArgs.Empty);
                 }
 
